@@ -114,6 +114,12 @@ ament_target_dependencies(${library_name} ${dependencies})
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
+
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_obstruction_polygons test/test_obstruction_polygons.cpp)
+  target_include_directories(test_obstruction_polygons PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  ament_target_dependencies(test_obstruction_polygons rclcpp)
 endif()
 
 install(TARGETS ${library_name}
