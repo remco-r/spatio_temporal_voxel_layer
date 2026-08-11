@@ -9,14 +9,37 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QSlider, QLabel, QFileDialog, QListWidget, QMessageBox,
     QInputDialog, QAction, QToolBar, QStatusBar, QSplitter,
-    QGroupBox, QCheckBox, QApplication, QUndoStack, QUndoCommand
+    QGroupBox, QCheckBox, QUndoStack, QUndoCommand
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor, QBrush
 
 from .range_image_widget import RangeImageWidget
 from .cloud_loader import OrganizedCloud, load_pcd
-from .convex_decomposition import hertel_mehlhorn
+from .convex_decomposition import hertel_mehlhorn, is_convex_angular_polygon, angular_to_dir as _angular_to_dir
 from .config_io import BlindSpotConfig, BlindSpotRegion, save_config, load_config, format_polygons_as_param_string
+
+
+def _dir_to_angular(d: np.ndarray) -> Tuple[float, float]:
+    """Unit 3D direction -> (azimuth in [0, 2pi], elevation)."""
+    az = float(np.arctan2(d[1], d[0]))
+    if az < 0:
+        az += 2.0 * np.pi
+    el = float(np.arctan2(d[2], np.hypot(d[0], d[1])))
+    return az, el
+
+
+def _slerp(d0: np.ndarray, d1: np.ndarray, t: float) -> np.ndarray:
+    """Spherical linear interpolation between two unit directions (the great-circle path)."""
+    dot = float(np.clip(np.dot(d0, d1), -1.0, 1.0))
+    omega = np.arccos(dot)
+    if omega < 1e-6:
+        d = (1.0 - t) * d0 + t * d1
+    else:
+        so = np.sin(omega)
+        d = (np.sin((1.0 - t) * omega) / so) * d0 + (np.sin(t * omega) / so) * d1
+    n = np.linalg.norm(d)
+    return d / n if n > 0 else d0
 
 
 class AddRegionCommand(QUndoCommand):
@@ -93,6 +116,17 @@ class MainWindow(QMainWindow):
         self._depth_max = 50.0
         self._threshold = 5.0
 
+        # Monotonic angular<->pixel axes (built lazily from the loaded cloud) used
+        # to draw polygon edges as their true great-circle arcs.
+        self._az_col_x: Optional[np.ndarray] = None
+        self._az_col_y: Optional[np.ndarray] = None
+        self._el_row_x: Optional[np.ndarray] = None
+        self._el_row_y: Optional[np.ndarray] = None
+        # Smooth per-index calibration (azimuth per column, elevation per row).
+        # Defined over the whole grid, including empty (nan/inf) pixels.
+        self._col_az: Optional[np.ndarray] = None
+        self._row_el: Optional[np.ndarray] = None
+
         self._setup_ui()
         self._setup_menu()
         self._connect_signals()
@@ -111,9 +145,7 @@ class MainWindow(QMainWindow):
         load_group = QGroupBox("Load Data")
         load_layout = QVBoxLayout(load_group)
         self._btn_load_pcd = QPushButton("Load PCD File")
-        self._btn_load_topic = QPushButton("Grab from ROS Topic")
         load_layout.addWidget(self._btn_load_pcd)
-        load_layout.addWidget(self._btn_load_topic)
         left_layout.addWidget(load_group)
 
         # Depth threshold
@@ -131,7 +163,7 @@ class MainWindow(QMainWindow):
         draw_group = QGroupBox("Draw Polygons")
         draw_layout = QVBoxLayout(draw_group)
         self._btn_new_polygon = QPushButton("New Polygon (click vertices)")
-        self._lbl_draw_help = QLabel("Enter = finish, Esc = cancel")
+        self._lbl_draw_help = QLabel("Enter = finish, Esc = cancel · may click just outside FOV")
         self._lbl_draw_help.setStyleSheet("color: gray; font-size: 10px;")
         draw_layout.addWidget(self._btn_new_polygon)
         draw_layout.addWidget(self._lbl_draw_help)
@@ -146,6 +178,11 @@ class MainWindow(QMainWindow):
         self._btn_decompose = QPushButton("Decompose All")
         self._chk_show_decomp = QCheckBox("Show Decomposition")
         self._chk_show_decomp.setChecked(True)
+        self._chk_show_arcs = QCheckBox("Show Great-Circle Arcs")
+        self._chk_show_arcs.setChecked(True)
+        self._chk_show_arcs.setToolTip(
+            "Draw polygon edges as the true great-circle arcs that STVL's isInside "
+            "test uses, instead of straight lines in the range image.")
         regions_layout.addWidget(self._list_regions)
         btn_row = QHBoxLayout()
         btn_row.addWidget(self._btn_rename_region)
@@ -153,6 +190,7 @@ class MainWindow(QMainWindow):
         regions_layout.addLayout(btn_row)
         regions_layout.addWidget(self._btn_decompose)
         regions_layout.addWidget(self._chk_show_decomp)
+        regions_layout.addWidget(self._chk_show_arcs)
         left_layout.addWidget(regions_group)
 
         # Save/Load
@@ -168,6 +206,8 @@ class MainWindow(QMainWindow):
 
         # Right panel: range image
         self._range_widget = RangeImageWidget()
+        self._range_widget.set_edge_interpolator(self._edge_arc_pixels)
+        self._range_widget.set_convexity_checker(self._is_region_convex)
 
         main_layout.addWidget(left_panel)
         main_layout.addWidget(self._range_widget, stretch=1)
@@ -197,18 +237,19 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         self._btn_load_pcd.clicked.connect(self._on_load_pcd)
-        self._btn_load_topic.clicked.connect(self._on_load_topic)
         self._slider_threshold.valueChanged.connect(self._on_threshold_changed)
         self._btn_new_polygon.clicked.connect(self._on_new_polygon)
         self._btn_rename_region.clicked.connect(self._on_rename_region)
         self._btn_delete_region.clicked.connect(self._on_delete_region)
         self._btn_decompose.clicked.connect(self._on_decompose)
         self._chk_show_decomp.toggled.connect(self._range_widget.toggle_decomposition_display)
+        self._chk_show_arcs.toggled.connect(self._range_widget.toggle_arc_display)
         self._btn_save.clicked.connect(self._on_save)
         self._btn_load_yaml.clicked.connect(self._on_load_yaml)
         self._range_widget.polygon_finished.connect(self._on_polygon_finished)
         self._range_widget.polygon_cancelled.connect(self._on_polygon_cancelled)
         self._range_widget.vertex_moved.connect(self._on_vertex_moved)
+        self._range_widget.vertex_deleted.connect(self._on_vertex_deleted)
 
     def _on_load_pcd(self):
         filepath, _ = QFileDialog.getOpenFileName(
@@ -218,68 +259,12 @@ class MainWindow(QMainWindow):
 
         try:
             self._cloud = load_pcd(filepath)
+            self._az_col_x = None
             self._update_range_image()
             self._status.showMessage(
                 f"Loaded: {filepath} ({self._cloud.width}×{self._cloud.height})")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load PCD:\n{e}")
-
-    def _on_load_topic(self):
-        """Grab a single frame from a ROS2 PointCloud2 topic."""
-        try:
-            import rclpy
-            from rclpy.node import Node
-            from sensor_msgs.msg import PointCloud2
-            from .cloud_loader import load_from_ros_msg_fast
-        except ImportError:
-            QMessageBox.warning(self, "ROS2 Not Available",
-                                "rclpy is not available. Please source your ROS2 workspace.")
-            return
-
-        topic, ok = QInputDialog.getText(self, "ROS Topic", "PointCloud2 topic:",
-                                         text="/points3d")
-        if not ok or not topic:
-            return
-
-        self._status.showMessage(f"Waiting for message on {topic}...")
-        QApplication.processEvents()
-
-        try:
-            rclpy.init()
-            node = Node('fov_boundary_tool_grabber')
-
-            msg_received = [None]
-
-            def callback(msg):
-                msg_received[0] = msg
-
-            sub = node.create_subscription(PointCloud2, topic, callback, 1)
-
-            # Spin until we get a message (with timeout)
-            import time
-            start = time.time()
-            while msg_received[0] is None and (time.time() - start) < 10.0:
-                rclpy.spin_once(node, timeout_sec=0.1)
-
-            node.destroy_node()
-            rclpy.shutdown()
-
-            if msg_received[0] is None:
-                QMessageBox.warning(self, "Timeout",
-                                    f"No message received on {topic} within 10 seconds.")
-                return
-
-            self._cloud = load_from_ros_msg_fast(msg_received[0])
-            self._update_range_image()
-            self._status.showMessage(
-                f"Grabbed from {topic} ({self._cloud.width}×{self._cloud.height})")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to grab from topic:\n{e}")
-            try:
-                rclpy.shutdown()
-            except:
-                pass
 
     def _on_threshold_changed(self, value: int):
         # Map slider 0-1000 to depth range
@@ -297,6 +282,9 @@ class MainWindow(QMainWindow):
         """Render the range image with depth threshold coloring."""
         if self._cloud is None:
             return
+
+        if self._az_col_x is None:
+            self._build_angular_axes()
 
         ranges = self._cloud.ranges  # (H, W)
         h, w = ranges.shape
@@ -351,12 +339,36 @@ class MainWindow(QMainWindow):
         self._range_widget.start_drawing()
         self._status.showMessage("Drawing: click to place vertices. Enter = finish, Esc = cancel.")
 
+    def _is_region_convex(self, region_pixels: List[Tuple[int, int]]) -> bool:
+        """True iff the region, projected to (azimuth, elevation), is a valid
+        convex half-plane cone - i.e. what STVL's `ConvexCone::fromAngularVertices`
+        would accept as a single half-plane region, not merely flat-pixel convex."""
+        if len(region_pixels) < 3:
+            return False
+        angular = [self._pixel_to_angular_model(px, py) for px, py in region_pixels]
+        return is_convex_angular_polygon(angular)
+
+    def _refresh_region_list(self):
+        """Rebuild the region list from the widget's current regions, marking
+        any that are not (spherically) convex."""
+        idx = self._list_regions.currentRow()
+        self._list_regions.clear()
+        for name, region in zip(self._range_widget.region_names, self._range_widget.regions):
+            convex = self._is_region_convex(region)
+            label = name if convex else f"{name} ⚠ non-convex"
+            self._list_regions.addItem(label)
+            if not convex:
+                self._list_regions.item(self._list_regions.count() - 1).setForeground(
+                    QBrush(QColor(255, 80, 80)))
+        if 0 <= idx < self._list_regions.count():
+            self._list_regions.setCurrentRow(idx)
+
     def _on_polygon_finished(self):
         """Called when user finishes a polygon (Enter key)."""
         regions = self._range_widget.regions
         if regions:
             name = f"region_{len(regions)}"
-            self._list_regions.addItem(name)
+            self._refresh_region_list()
             self._status.showMessage(f"Region '{name}' created with {len(regions[-1])} vertices.")
         # Stay in drawing mode for next polygon
         self._range_widget.start_drawing()
@@ -372,7 +384,7 @@ class MainWindow(QMainWindow):
         new_name, ok = QInputDialog.getText(self, "Rename Region", "New name:", text=old_name)
         if ok and new_name:
             self._range_widget._region_names[idx] = new_name
-            self._list_regions.item(idx).setText(new_name)
+            self._refresh_region_list()
 
     def _on_delete_region(self):
         idx = self._list_regions.currentRow()
@@ -380,7 +392,7 @@ class MainWindow(QMainWindow):
             return
         cmd = RemoveRegionCommand(self._range_widget, idx)
         self._undo_stack.push(cmd)
-        self._list_regions.takeItem(idx)
+        self._refresh_region_list()
         self._status.showMessage("Region deleted.")
 
     def _on_decompose(self):
@@ -391,12 +403,15 @@ class MainWindow(QMainWindow):
 
         all_decomposed = []
         total_convex = 0
+        non_convex_inputs = 0
 
         for region_pixels in self._range_widget.regions:
-            # Convert pixel coords to (azimuth, elevation) for decomposition
-            # But decomposition works in any 2D space, so we can work in pixel space
+            if not self._is_region_convex(region_pixels):
+                non_convex_inputs += 1
+            # Decomposition needs to test convexity in the (azimuth, elevation)
+            # half-plane sense, not flat pixel space - pass the conversion in.
             polygon = [(float(x), float(y)) for x, y in region_pixels]
-            convex_parts = hertel_mehlhorn(polygon)
+            convex_parts = hertel_mehlhorn(polygon, self._pixel_to_angular_model)
             # Convert back to int pixel coords for display
             convex_parts_int = [
                 [(int(round(x)), int(round(y))) for x, y in poly]
@@ -408,11 +423,16 @@ class MainWindow(QMainWindow):
         self._range_widget.set_decomposition(all_decomposed)
         self._status.showMessage(
             f"Decomposition complete: {len(self._range_widget.regions)} regions → "
-            f"{total_convex} convex polygons.")
+            f"{total_convex} convex polygons ({non_convex_inputs} were non-convex and got split).")
 
     def _on_vertex_moved(self, ri: int, vi: int, new_x: int, new_y: int):
         # Could track for undo - simplified here
+        self._refresh_region_list()
         self._status.showMessage(f"Vertex moved in region {ri}.")
+
+    def _on_vertex_deleted(self, ri: int, vi: int):
+        self._refresh_region_list()
+        self._status.showMessage(f"Vertex deleted from region {ri}.")
 
     def _pixel_to_angular(self, px: int, py: int) -> Tuple[float, float]:
         """Convert pixel coordinates to (azimuth, elevation) in radians.
@@ -424,6 +444,12 @@ class MainWindow(QMainWindow):
         """
         if self._cloud is None:
             return (0.0, 0.0)
+
+        # Out-of-FOV vertex (drawn beyond the image): use the extrapolating model
+        # so boundaries can extend past the grid instead of being clamped to it.
+        if self._col_az is not None and not (
+                0 <= px < self._cloud.width and 0 <= py < self._cloud.height):
+            return self._pixel_to_angular_model(px, py)
 
         # Clamp to valid range
         py = max(0, min(py, self._cloud.height - 1))
@@ -438,6 +464,12 @@ class MainWindow(QMainWindow):
                 az += 2.0 * np.pi
             el = float(np.arctan2(z, np.sqrt(x**2 + y**2)))
             return (az, el)
+
+        # Point is invalid (empty/nan/inf pixel). Prefer the smooth calibration
+        # model, which is defined everywhere, over snapping to a nearby valid
+        # return (snapping warps boundaries drawn through empty space).
+        if self._col_az is not None:
+            return self._pixel_to_angular_model(px, py)
 
         # Point is invalid — search neighbors in expanding radius
         for radius in range(1, 20):
@@ -500,6 +532,124 @@ class MainWindow(QMainWindow):
             el = el_min + (py / self._cloud.height) * (el_max - el_min)
 
         return (az, el)
+
+    def _build_angular_axes(self):
+        """Precompute monotonic per-column azimuth and per-row elevation lookup
+        axes so angular coords can be inverted back to pixel coords for arc drawing."""
+        if self._cloud is None:
+            return
+        az = self._cloud.azimuths
+        el = self._cloud.elevations
+        rng = self._cloud.ranges
+        valid = np.isfinite(az) & np.isfinite(el) & (rng > 0)
+
+        az_masked = np.where(valid, az, np.nan)
+        el_masked = np.where(valid, el, np.nan)
+        with np.errstate(invalid='ignore'):
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                col_vals = np.nanmedian(az_masked, axis=0)  # (W,)
+                row_vals = np.nanmedian(el_masked, axis=1)  # (H,)
+
+        col_vals = np.unwrap(self._fill_nan(col_vals))
+        row_vals = self._fill_nan(row_vals)
+
+        # Smooth per-index calibration (used for a consistent pixel<->angle model).
+        self._col_az = col_vals
+        self._row_el = row_vals
+
+        self._az_col_x, self._az_col_y = self._as_increasing(
+            col_vals, np.arange(self._cloud.width, dtype=float))
+        self._el_row_x, self._el_row_y = self._as_increasing(
+            row_vals, np.arange(self._cloud.height, dtype=float))
+
+    @staticmethod
+    def _fill_nan(a: np.ndarray) -> np.ndarray:
+        """Linearly fill NaN entries in a 1D array along its index."""
+        a = np.asarray(a, dtype=float).copy()
+        idx = np.arange(len(a))
+        good = np.isfinite(a)
+        if not np.any(good):
+            return np.zeros_like(a)
+        a[~good] = np.interp(idx[~good], idx[good], a[good])
+        return a
+
+    @staticmethod
+    def _as_increasing(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Sort (x, y) so x is strictly increasing (required by np.interp)."""
+        order = np.argsort(x, kind='stable')
+        return x[order], y[order]
+
+    @staticmethod
+    def _interp_extrap(x: float, xp: np.ndarray, fp: np.ndarray) -> float:
+        """Linear interpolation that also linearly *extrapolates* beyond the ends
+        (np.interp clamps). Lets vertices/arcs extend just outside the FOV grid."""
+        x = float(x)
+        if x < xp[0]:
+            slope = (fp[1] - fp[0]) / (xp[1] - xp[0])
+            return float(fp[0] + (x - xp[0]) * slope)
+        if x > xp[-1]:
+            slope = (fp[-1] - fp[-2]) / (xp[-1] - xp[-2])
+            return float(fp[-1] + (x - xp[-1]) * slope)
+        return float(np.interp(x, xp, fp))
+
+    def _pixel_to_angular_model(self, px: float, py: float) -> Tuple[float, float]:
+        """Smooth, hole-free pixel -> (azimuth, elevation) using the per-column /
+        per-row calibration. Unlike `_pixel_to_angular`, this is defined everywhere
+        (also over nan/inf pixels) and is the exact inverse of `_angular_to_pixel`,
+        so arcs traced with it are clean and independent of local data occupancy.
+        Pixels outside the grid are linearly extrapolated so boundaries can be drawn
+        slightly beyond the FOV (e.g. to fully enclose the outermost pixel row)."""
+        if self._col_az is None:
+            return self._pixel_to_angular(int(round(px)), int(round(py)))
+        W = len(self._col_az)
+        H = len(self._row_el)
+        az = self._interp_extrap(px, np.arange(W, dtype=float), self._col_az) % (2.0 * np.pi)
+        el = self._interp_extrap(py, np.arange(H, dtype=float), self._row_el)
+        return (az, el)
+
+    def _angular_to_pixel(self, az: float, el: float) -> Tuple[float, float]:
+        """Inverse of `_pixel_to_angular`: (azimuth, elevation) -> pixel coords.
+        Extrapolates beyond the grid so out-of-FOV angles map to out-of-image pixels."""
+        if self._az_col_x is None:
+            return (0.0, 0.0)
+        # Bring azimuth into the same (unwrapped) branch as the column axis.
+        center = 0.5 * (self._az_col_x[0] + self._az_col_x[-1])
+        a = az
+        while a - center > np.pi:
+            a -= 2.0 * np.pi
+        while center - a > np.pi:
+            a += 2.0 * np.pi
+        px = self._interp_extrap(a, self._az_col_x, self._az_col_y)
+        py = self._interp_extrap(el, self._el_row_x, self._el_row_y)
+        return (px, py)
+
+    def _angular_to_pixel_int(self, az: float, el: float) -> Tuple[int, int]:
+        """Integer-pixel variant of `_angular_to_pixel` for placing loaded vertices."""
+        px, py = self._angular_to_pixel(az, el)
+        return (int(round(px)), int(round(py)))
+
+    def _edge_arc_pixels(self, v0: Tuple[int, int], v1: Tuple[int, int],
+                         n: int = 24) -> List[Tuple[float, float]]:
+        """Trace the great-circle arc between two pixel vertices, returning a list
+        of intermediate pixel points. This matches STVL's `isInside` edge semantics
+        (a half-plane test against the great circle through the two edge directions)."""
+        if self._cloud is None or self._az_col_x is None:
+            return [(float(v0[0]), float(v0[1])), (float(v1[0]), float(v1[1]))]
+        a0 = self._pixel_to_angular_model(v0[0], v0[1])
+        a1 = self._pixel_to_angular_model(v1[0], v1[1])
+        d0 = _angular_to_dir(*a0)
+        d1 = _angular_to_dir(*a1)
+        pts: List[Tuple[float, float]] = []
+        for t in np.linspace(0.0, 1.0, n):
+            d = _slerp(d0, d1, float(t))
+            az, el = _dir_to_angular(d)
+            pts.append(self._angular_to_pixel(az, el))
+        # Pin endpoints to the exact clicked pixels so arcs meet the drawn vertices.
+        pts[0] = (float(v0[0]), float(v0[1]))
+        pts[-1] = (float(v1[0]), float(v1[1]))
+        return pts
 
     def _on_save(self):
         if not self._range_widget.regions:
@@ -579,8 +729,8 @@ class MainWindow(QMainWindow):
         decomposed_pixels = []
 
         for region in config.regions:
-            # Convert angular vertices to pixel coords
-            pixels = [self._angular_to_pixel(az, el)
+            # Convert angular vertices to pixel coords (smooth calibration model)
+            pixels = [self._angular_to_pixel_int(az, el)
                       for az, el in region.original_vertices]
             regions_pixels.append(pixels)
             region_names.append(region.name)
@@ -588,46 +738,15 @@ class MainWindow(QMainWindow):
             # Convert decomposed polygons
             decomp = []
             for poly in region.convex_polygons:
-                poly_pixels = [self._angular_to_pixel(az, el) for az, el in poly]
+                poly_pixels = [self._angular_to_pixel_int(az, el) for az, el in poly]
                 decomp.append(poly_pixels)
             decomposed_pixels.append(decomp)
 
         self._range_widget.set_regions(regions_pixels, region_names)
         self._range_widget.set_decomposition(decomposed_pixels)
 
-        # Update list widget
-        self._list_regions.clear()
-        for name in region_names:
-            self._list_regions.addItem(name)
+        self._refresh_region_list()
 
         self._status.showMessage(
             f"Loaded {len(config.regions)} regions from {filepath}")
 
-    def _angular_to_pixel(self, azimuth: float, elevation: float) -> Tuple[int, int]:
-        """Convert (azimuth, elevation) in radians to pixel coordinates.
-
-        Uses the cloud's actual angular layout to find the nearest pixel.
-        """
-        if self._cloud is None:
-            return (0, 0)
-
-        # Compute angular maps
-        azimuths = self._cloud.azimuths  # (H, W)
-        elevations = self._cloud.elevations  # (H, W)
-
-        # Find nearest valid pixel
-        valid = self._cloud.ranges > 0
-        if not np.any(valid):
-            return (0, 0)
-
-        # Angular distance
-        az_diff = np.abs(azimuths - azimuth)
-        # Handle wraparound
-        az_diff = np.minimum(az_diff, 2 * np.pi - az_diff)
-        el_diff = np.abs(elevations - elevation)
-
-        dist = az_diff + el_diff
-        dist[~valid] = np.inf
-
-        idx = np.unravel_index(np.argmin(dist), dist.shape)
-        return (int(idx[1]), int(idx[0]))  # (x=col, y=row)
