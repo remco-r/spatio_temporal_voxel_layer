@@ -2,10 +2,10 @@
 
 import numpy as np
 from PyQt5.QtWidgets import QWidget, QSizePolicy
-from PyQt5.QtCore import Qt, pyqtSignal, QPoint, QPointF
+from PyQt5.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRectF
 from PyQt5.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QPolygonF,
                           QBrush, QMouseEvent, QKeyEvent)
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable
 
 
 class RangeImageWidget(QWidget):
@@ -48,6 +48,23 @@ class RangeImageWidget(QWidget):
         self._offset_y = 0
         self._show_decomposition = True
 
+        # Great-circle arc rendering. When set, `_edge_interp(v0, v1)` returns a
+        # list of image-space pixel points tracing the true great-circle arc that
+        # STVL's `isInside` half-plane test actually uses for the edge v0->v1.
+        self._edge_interp: Optional[Callable[[Tuple[int, int], Tuple[int, int]],
+                                             List[Tuple[float, float]]]] = None
+        self._show_arcs = True
+
+        # When set, `_is_convex_fn(region)` reports whether a completed region is
+        # a valid convex half-plane cone (spherical convexity, not flat-pixel).
+        # Non-convex regions get a warning outline in paintEvent.
+        self._is_convex_fn: Optional[Callable[[List[Tuple[int, int]]], bool]] = None
+
+        # Allow vertices to be placed this fraction beyond each image edge, so a
+        # boundary can be drawn slightly outside the FOV (e.g. to fully enclose the
+        # outermost pixel row/column).
+        self._oob_margin_frac = 0.02
+
     def set_image(self, image_data: np.ndarray):
         """Set the range image to display. Expects RGB uint8 array (H, W, 3)."""
         self._image_data = image_data
@@ -72,7 +89,11 @@ class RangeImageWidget(QWidget):
             return
         scale_x = ww / pw
         scale_y = wh / ph
-        self._scale = min(scale_x, scale_y)
+        # Shrink so there is a clickable margin all around the image, sized to the
+        # allowed out-of-FOV placement margin. This lets vertices be placed outside
+        # the FOV on every side (including the azimuth edges), not just in letterbox.
+        m = self._oob_margin_frac
+        self._scale = min(scale_x, scale_y) / (1.0 + 2.0 * m)
         self._offset_x = (ww - pw * self._scale) / 2
         self._offset_y = (wh - ph * self._scale) / 2
 
@@ -87,6 +108,18 @@ class RangeImageWidget(QWidget):
         wx = ix * self._scale + self._offset_x
         wy = iy * self._scale + self._offset_y
         return wx, wy
+
+    def _clamp_image_coords(self, ix: int, iy: int) -> Tuple[int, int]:
+        """Clamp image coords to the allowed range, permitting a margin outside the
+        image so vertices can be placed slightly beyond the FOV."""
+        if self._pixmap is None:
+            return ix, iy
+        w, h = self._pixmap.width(), self._pixmap.height()
+        mx = max(2, int(round(self._oob_margin_frac * w)))
+        my = max(2, int(round(self._oob_margin_frac * h)))
+        ix = max(-mx, min(ix, w - 1 + mx))
+        iy = max(-my, min(iy, h - 1 + my))
+        return ix, iy
 
     def start_drawing(self):
         """Enter polygon drawing mode."""
@@ -125,6 +158,47 @@ class RangeImageWidget(QWidget):
         self._show_decomposition = show
         self.update()
 
+    def set_edge_interpolator(self, fn: Optional[Callable[[Tuple[int, int], Tuple[int, int]],
+                                                          List[Tuple[float, float]]]]):
+        """Provide a callback mapping an edge (v0, v1) in image pixels to a list of
+        intermediate image-pixel points tracing the true great-circle arc."""
+        self._edge_interp = fn
+        self.update()
+
+    def toggle_arc_display(self, show: bool):
+        self._show_arcs = show
+        self.update()
+
+    def set_convexity_checker(self, fn: Optional[Callable[[List[Tuple[int, int]]], bool]]):
+        """Provide a callback reporting whether a completed region (list of pixel
+        vertices) is a valid convex half-plane cone. Used to flag non-convex
+        regions in paintEvent."""
+        self._is_convex_fn = fn
+        self.update()
+
+    def _edge_widget_points(self, v0: Tuple[int, int],
+                            v1: Tuple[int, int]) -> List[QPointF]:
+        """Widget-space points along edge v0->v1, following the great-circle arc
+        if an interpolator is available, else a straight chord."""
+        if self._show_arcs and self._edge_interp is not None:
+            try:
+                img_pts = self._edge_interp(v0, v1)
+            except Exception:
+                img_pts = [v0, v1]
+        else:
+            img_pts = [v0, v1]
+        return [QPointF(*self._image_to_widget(px, py)) for px, py in img_pts]
+
+    def _ring_polygon(self, verts: List[Tuple[int, int]]) -> QPolygonF:
+        """Build a closed QPolygonF tracing arcs around the vertex ring."""
+        poly = QPolygonF()
+        n = len(verts)
+        for i in range(n):
+            pts = self._edge_widget_points(verts[i], verts[(i + 1) % n])
+            for p in pts[:-1]:  # drop last to avoid duplicating shared vertices
+                poly.append(p)
+        return poly
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._fit_to_widget()
@@ -144,6 +218,13 @@ class RangeImageWidget(QWidget):
             painter.drawPixmap(0, 0, self._pixmap)
             painter.restore()
 
+            # Outline the FOV (image extent) so the clickable out-of-FOV margin is visible.
+            x0, y0 = self._image_to_widget(0, 0)
+            x1, y1 = self._image_to_widget(self._pixmap.width(), self._pixmap.height())
+            painter.setPen(QPen(QColor(180, 180, 180, 160), 1, Qt.DashLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(QRectF(x0, y0, x1 - x0, y1 - y0))
+
         # Draw completed regions
         colors = [
             QColor(255, 100, 100, 80), QColor(100, 255, 100, 80),
@@ -153,20 +234,26 @@ class RangeImageWidget(QWidget):
 
         for ri, region in enumerate(self._regions):
             color = colors[ri % len(colors)]
-            pen = QPen(color.darker(150), 2)
-            painter.setPen(pen)
+            is_convex = (len(region) < 3 or self._is_convex_fn is None
+                         or self._is_convex_fn(region))
+            if is_convex:
+                outline_pen = QPen(color.darker(150), 2)
+                vertex_color = color.darker(120)
+            else:
+                # Warn: this region isn't a valid single half-plane cone and
+                # will be split into multiple convex parts on decomposition.
+                outline_pen = QPen(QColor(255, 40, 40), 3, Qt.DashLine)
+                vertex_color = QColor(255, 40, 40)
+            painter.setPen(outline_pen)
 
-            # Draw filled polygon
+            # Draw filled polygon (edges follow great-circle arcs)
             if len(region) >= 3:
-                poly = QPolygonF()
-                for vx, vy in region:
-                    wx, wy = self._image_to_widget(vx, vy)
-                    poly.append(QPointF(wx, wy))
+                poly = self._ring_polygon(region)
                 painter.setBrush(QBrush(color))
                 painter.drawPolygon(poly)
 
             # Draw vertices
-            painter.setBrush(QBrush(color.darker(120)))
+            painter.setBrush(QBrush(vertex_color))
             for vx, vy in region:
                 wx, wy = self._image_to_widget(vx, vy)
                 painter.drawEllipse(QPointF(wx, wy), 4, 4)
@@ -184,10 +271,7 @@ class RangeImageWidget(QWidget):
                     dc = decomp_colors[ci % len(decomp_colors)]
                     painter.setPen(QPen(dc.darker(100), 1.5, Qt.DashLine))
                     painter.setBrush(QBrush(dc))
-                    poly = QPolygonF()
-                    for vx, vy in convex_poly:
-                        wx, wy = self._image_to_widget(vx, vy)
-                        poly.append(QPointF(wx, wy))
+                    poly = self._ring_polygon(convex_poly)
                     painter.drawPolygon(poly)
                     ci += 1
 
@@ -197,11 +281,12 @@ class RangeImageWidget(QWidget):
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
 
-            # Draw edges
+            # Draw edges (following great-circle arcs)
             for i in range(len(self._current_vertices) - 1):
-                x1, y1 = self._image_to_widget(*self._current_vertices[i])
-                x2, y2 = self._image_to_widget(*self._current_vertices[i + 1])
-                painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+                pts = self._edge_widget_points(
+                    self._current_vertices[i], self._current_vertices[i + 1])
+                for j in range(len(pts) - 1):
+                    painter.drawLine(pts[j], pts[j + 1])
 
             # Draw closing line preview (last vertex -> mouse -> first vertex)
             if self._mouse_pos and len(self._current_vertices) >= 1:
@@ -232,11 +317,13 @@ class RangeImageWidget(QWidget):
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
             if self._is_drawing:
+                if self._pixmap is None:
+                    return
                 ix, iy = self._widget_to_image(event.x(), event.y())
-                if self._pixmap and 0 <= ix < self._pixmap.width() and 0 <= iy < self._pixmap.height():
-                    self._current_vertices.append((ix, iy))
-                    self.vertex_placed.emit(ix, iy)
-                    self.update()
+                ix, iy = self._clamp_image_coords(ix, iy)
+                self._current_vertices.append((ix, iy))
+                self.vertex_placed.emit(ix, iy)
+                self.update()
             else:
                 # Check if clicking near a vertex for dragging
                 self._check_vertex_drag(event.x(), event.y())
@@ -251,8 +338,9 @@ class RangeImageWidget(QWidget):
             self.update()
         elif self._dragging is not None:
             ix, iy = self._widget_to_image(event.x(), event.y())
+            ix, iy = self._clamp_image_coords(ix, iy)
             ri, vi = self._dragging
-            if self._pixmap and 0 <= ix < self._pixmap.width() and 0 <= iy < self._pixmap.height():
+            if self._pixmap:
                 self._regions[ri][vi] = (ix, iy)
                 self.update()
 

@@ -1,7 +1,7 @@
 """Hertel-Mehlhorn convex decomposition algorithm."""
 
 import numpy as np
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 from scipy.spatial import Delaunay
 
 
@@ -14,7 +14,13 @@ def cross_2d(o: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
 
 
 def is_convex_polygon(vertices: List[np.ndarray]) -> bool:
-    """Check if a polygon (list of 2D points) is convex."""
+    """Check if a flat 2D polygon (list of 2D points) is convex.
+
+    This is a planar test only. It is used internally by the ear-clipping
+    triangulation below (a planar operation), NOT as the authoritative
+    convexity test for the final half-plane geometry - see
+    `is_convex_angular_polygon` for that.
+    """
     n = len(vertices)
     if n < 3:
         return False
@@ -32,6 +38,58 @@ def is_convex_polygon(vertices: List[np.ndarray]) -> bool:
         elif (c > 0) != sign:
             return False
     return True
+
+
+def angular_to_dir(az: float, el: float) -> np.ndarray:
+    """(azimuth, elevation) -> unit 3D direction, matching the cloud convention
+    az = atan2(y, x), el = atan2(z, hypot(x, y)). Must match
+    `ConvexCone::fromAngularVertices` in obstruction_polygons.hpp exactly."""
+    ce = np.cos(el)
+    return np.array([ce * np.cos(az), ce * np.sin(az), np.sin(el)])
+
+
+def is_convex_cone(directions: List[np.ndarray]) -> bool:
+    """Check spherical convexity of a polygon of unit 3D directions: is it a
+    valid convex cone, i.e. the intersection of great-circle half-planes (one
+    per edge) with every vertex on the inside of every half-plane?
+
+    This is a direct port of `ConvexCone::fromAngularVertices`'s convexity
+    check in obstruction_polygons.hpp - the actual ground-truth test the STVL
+    runtime uses to accept/reject a half-plane polygon. It is NOT equivalent
+    to flat 2D convexity of the (azimuth, elevation) polygon: az/el projection
+    distorts angles, so a flat-convex polygon can be spherically non-convex
+    and vice versa.
+    """
+    n = len(directions)
+    if n < 3:
+        return False
+
+    normals = []
+    for i in range(n):
+        j = (i + 1) % n
+        normal = np.cross(directions[i], directions[j])
+        if np.dot(normal, normal) < 1e-12:
+            return False  # degenerate edge (coincident vertices)
+        normals.append(normal)
+
+    # Determine orientation: centroid direction should be on inside of all half-planes
+    centroid = np.sum(directions, axis=0)
+    if np.dot(normals[0], centroid) < 0.0:
+        normals = [-normal for normal in normals]
+
+    kConvexEps = 1e-9
+    for normal in normals:
+        for d in directions:
+            if np.dot(normal, d) < -kConvexEps:
+                return False  # non-convex: some vertex is outside this half-plane
+    return True
+
+
+def is_convex_angular_polygon(vertices: List[Tuple[float, float]]) -> bool:
+    """Check spherical convexity of a polygon given as (azimuth, elevation)
+    tuples in radians - the authoritative "is this a valid single half-plane
+    region" test, matching what the STVL runtime will accept."""
+    return is_convex_cone([angular_to_dir(az, el) for az, el in vertices])
 
 
 def ear_clip_triangulate(polygon: Polygon) -> List[Tuple[int, int, int]]:
@@ -123,12 +181,14 @@ def point_in_triangle(p: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray
 
 
 def _can_merge(poly_a: List[int], poly_b: List[int], shared_edge: Tuple[int, int],
-               vertices: List[np.ndarray]) -> bool:
-    """Check if merging two polygons along a shared edge produces a convex polygon."""
+               vertices: List[np.ndarray],
+               to_angular: Callable[[float, float], Tuple[float, float]]) -> bool:
+    """Check if merging two polygons along a shared edge produces a polygon
+    that is convex in the spherical/half-plane sense (not just flat-planar)."""
     merged = _merge_polygons(poly_a, poly_b, shared_edge)
     if merged is None:
         return False
-    return is_convex_polygon([vertices[i] for i in merged])
+    return is_convex_angular_polygon([to_angular(*vertices[i]) for i in merged])
 
 
 def _merge_polygons(poly_a: List[int], poly_b: List[int],
@@ -162,15 +222,13 @@ def _merge_polygons(poly_a: List[int], poly_b: List[int],
     if edge_pos_b is None:
         return None
 
-    # Build merged polygon: walk poly_a skipping e0->e1 edge, insert poly_b vertices
-    merged = []
-    for i in range(n_a):
-        idx = (edge_pos_a + 1 + i) % n_a
-        if idx == edge_pos_a:
-            break
-        merged.append(poly_a[idx])
+    # Build merged polygon: walk all of poly_a starting right after the shared
+    # edge's e1 endpoint and ending back at e0 (this visits every poly_a vertex
+    # exactly once, including e0 itself - dropping it would lose a vertex).
+    merged = [poly_a[(edge_pos_a + 1 + i) % n_a] for i in range(n_a)]
 
-    # Insert poly_b vertices (excluding the shared edge endpoints if they're just connectors)
+    # Insert poly_b's interior vertices (excluding the shared edge endpoints,
+    # which poly_a's walk above already contributed).
     for i in range(1, n_b - 1):
         idx = (edge_pos_b + 1 + i) % n_b
         merged.append(poly_b[idx])
@@ -178,25 +236,31 @@ def _merge_polygons(poly_a: List[int], poly_b: List[int],
     return merged if len(merged) >= 3 else None
 
 
-def hertel_mehlhorn(polygon: Polygon) -> List[Polygon]:
-    """Decompose a simple polygon into convex parts using Hertel-Mehlhorn.
+def hertel_mehlhorn(polygon: Polygon,
+                    to_angular: Callable[[float, float], Tuple[float, float]]) -> List[Polygon]:
+    """Decompose a simple polygon into spherically-convex parts using Hertel-Mehlhorn.
 
-    1. Triangulate using ear clipping
-    2. Iteratively remove internal diagonals that keep both sides convex
+    1. Triangulate using ear clipping (flat, in the polygon's own 2D domain)
+    2. Iteratively remove internal diagonals whose merge keeps both sides
+       convex in the spherical/half-plane sense - i.e. each output part is a
+       valid `ConvexCone` (see `is_convex_angular_polygon`), not merely
+       flat-planar convex.
 
     Args:
-        polygon: List of (azimuth, elevation) tuples defining a simple polygon.
+        polygon: List of 2D points (e.g. pixel coordinates) defining a simple polygon.
+        to_angular: Converts one polygon vertex (x, y) to (azimuth, elevation)
+            radians, used to test spherical convexity of candidate merged faces.
 
     Returns:
-        List of convex polygons, each a list of (azimuth, elevation) tuples.
+        List of convex polygons, each a list of points in the same domain as `polygon`.
     """
     if len(polygon) < 3:
         return []
 
     vertices = [np.array(p, dtype=np.float64) for p in polygon]
 
-    # Check if already convex
-    if is_convex_polygon(vertices):
+    # Check if already spherically convex
+    if is_convex_angular_polygon([to_angular(*p) for p in polygon]):
         return [polygon]
 
     # Step 1: Triangulate
@@ -251,9 +315,9 @@ def hertel_mehlhorn(polygon: Polygon) -> List[Polygon]:
                 continue
 
             shared = (canonical[0], canonical[1])
-            if _can_merge(polys[pi_a], polys[pi_b], shared, vertices):
+            if _can_merge(polys[pi_a], polys[pi_b], shared, vertices, to_angular):
                 merged = _merge_polygons(polys[pi_a], polys[pi_b], shared)
-                if merged and is_convex_polygon([vertices[i] for i in merged]):
+                if merged and is_convex_angular_polygon([to_angular(*vertices[i]) for i in merged]):
                     # Replace pi_a with merged, remove pi_b
                     polys[pi_a] = merged
                     polys.pop(pi_b)

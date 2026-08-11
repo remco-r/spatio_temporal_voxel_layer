@@ -20,7 +20,7 @@ fov_boundary_tool
 
 ## Workflow
 
-1. **Load** an organized point cloud (PCD file or ROS2 topic)
+1. **Load** an organized point cloud (PCD file)
 2. **Adjust** the depth threshold slider to highlight close objects (robot body)
 3. **Draw** polygon regions around blind spots:
    - Click to place vertices
@@ -61,4 +61,3 @@ regions:
 - NumPy
 - SciPy
 - PyYAML
-- rclpy (optional, for ROS2 topic grabbing)

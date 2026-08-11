@@ -10,9 +10,6 @@ setup(
         'PyYAML',
         'scipy',
     ],
-    extras_require={
-        'ros': ['rclpy', 'sensor_msgs'],
-    },
     entry_points={
         'console_scripts': [
             'fov_boundary_tool=fov_boundary_tool.main:main',
