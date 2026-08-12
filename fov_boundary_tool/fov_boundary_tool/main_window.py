@@ -15,7 +15,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QBrush
 
 from .range_image_widget import RangeImageWidget
-from .cloud_loader import OrganizedCloud, load_pcd
+from .cloud_loader import OrganizedCloud, load_pcd, unfold_cloud
 from .convex_decomposition import hertel_mehlhorn, is_convex_angular_polygon, angular_to_dir as _angular_to_dir
 from .config_io import BlindSpotConfig, BlindSpotRegion, save_config, load_config, format_polygons_as_param_string
 
@@ -259,12 +259,38 @@ class MainWindow(QMainWindow):
 
         try:
             self._cloud = load_pcd(filepath)
-            self._az_col_x = None
-            self._update_range_image()
-            self._status.showMessage(
-                f"Loaded: {filepath} ({self._cloud.width}×{self._cloud.height})")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load PCD:\n{e}")
+            return
+
+        if self._cloud.height == 1 and self._cloud.width > 1:
+            self._prompt_unfold_cloud()
+
+        self._az_col_x = None
+        self._update_range_image()
+        self._status.showMessage(
+            f"Loaded: {filepath} ({self._cloud.width}×{self._cloud.height})")
+
+    def _prompt_unfold_cloud(self):
+        """Ask the user for the number of channels/rings and reshape an
+        unorganized (flat) cloud into an organized (height, width) grid.
+        Loops on an invalid height so the user can retry without re-reading
+        the file; cancelling leaves the cloud as its 1-row fallback."""
+        total_points = self._cloud.width
+        while True:
+            height, ok = QInputDialog.getInt(
+                self, "Unorganized Cloud",
+                f"This cloud has {total_points} points and no organized grid.\n"
+                "Enter the number of channels/rings (height) to unfold it into "
+                "a matrix (Cancel to leave it as a single row):",
+                value=1, min=1, max=total_points)
+            if not ok:
+                return
+            try:
+                self._cloud = unfold_cloud(self._cloud, height)
+                return
+            except ValueError as e:
+                QMessageBox.warning(self, "Invalid Height", str(e))
 
     def _on_threshold_changed(self, value: int):
         # Map slider 0-1000 to depth range

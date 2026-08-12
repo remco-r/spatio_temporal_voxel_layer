@@ -147,3 +147,43 @@ def load_pcd(filepath: str) -> OrganizedCloud:
             xyz = xyz.reshape(1, width, 3)
 
     return OrganizedCloud(xyz=xyz, frame_id="sensor")
+
+
+def unfold_cloud(cloud: OrganizedCloud, height: int) -> OrganizedCloud:
+    """Reshape a flat/unorganized cloud (height == 1) into an organized
+    (height, width, 3) grid. `height` is the number of channels/rings -
+    lidar drivers typically emit unorganized points azimuth-major,
+    channel-minor (one full vertical column across all channels per azimuth
+    step, then the next azimuth step), so `height` is the fast-varying run
+    length in the raw flat order. The reshape uses it as the fast axis, then
+    transposes so the result matches this tool's row=elevation-channel /
+    column=azimuth convention (see _build_angular_axes in main_window.py).
+
+    The raw channel index's direction (does it run top-to-bottom or
+    bottom-to-top of the sensor's vertical FOV?) is sensor/driver-specific
+    and unknown here, so the row order is corrected using the actual
+    elevation of the data itself: row 0 (displayed at the top of the range
+    image) is oriented to be the highest-elevation row, matching the
+    intuitive "up" of a picture, regardless of which way the raw channel
+    index happened to run.
+    """
+    total_points = cloud.xyz.shape[1]
+    if height <= 0 or total_points % height != 0:
+        raise ValueError(f"{total_points} points is not evenly divisible by height {height}.")
+    width = total_points // height
+    xyz = cloud.xyz.reshape(width, height, 3).transpose(1, 0, 2)
+
+    ranges = np.linalg.norm(xyz, axis=2)
+    elevations = np.arctan2(xyz[:, :, 2], np.hypot(xyz[:, :, 0], xyz[:, :, 1]))
+    valid = (ranges > 0) & np.isfinite(elevations)
+
+    def row_median_elevation(row: int) -> float:
+        vals = elevations[row][valid[row]]
+        return float(np.median(vals)) if vals.size else float('nan')
+
+    first_el = row_median_elevation(0)
+    last_el = row_median_elevation(height - 1)
+    if np.isfinite(first_el) and np.isfinite(last_el) and first_el < last_el:
+        xyz = xyz[::-1, :, :].copy()
+
+    return OrganizedCloud(xyz=xyz, frame_id=cloud.frame_id)
