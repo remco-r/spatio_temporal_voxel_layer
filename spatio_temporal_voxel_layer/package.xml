@@ -34,6 +34,7 @@
   <depend>libopenexr-dev</depend>
 
   <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
   <export>
     <costmap_2d plugin="${prefix}/costmap_plugins.xml" />
