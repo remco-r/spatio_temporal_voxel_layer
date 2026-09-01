@@ -311,6 +311,7 @@ class MainWindow(QMainWindow):
 
         if self._az_col_x is None:
             self._build_angular_axes()
+            self._range_widget.set_wrap_period(self._az_pixel_period())
 
         ranges = self._cloud.ranges  # (H, W)
         h, w = ranges.shape
@@ -656,11 +657,53 @@ class MainWindow(QMainWindow):
         px, py = self._angular_to_pixel(az, el)
         return (int(round(px)), int(round(py)))
 
+    def _az_pixel_period(self) -> Optional[float]:
+        """Width in pixels of a full 2pi azimuth turn, or None if this cloud does not
+        cover a full panorama. Only a full turn is periodic in x, so only then may an
+        arc that leaves one side of the image be redrawn re-entering the other."""
+        if self._col_az is None or len(self._col_az) < 2:
+            return None
+        span = abs(float(self._col_az[-1] - self._col_az[0]))
+        if span < 0.9 * 2.0 * np.pi:
+            return None
+        return abs(2.0 * np.pi * (len(self._col_az) - 1) / span)
+
+    def _unwrap_px(self, pts: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """Remove +/- one-period jumps from the x coordinates of an arc polyline.
+
+        `_angular_to_pixel` folds every azimuth into the column axis' own branch, so
+        an arc sweeping across the 0/2pi seam comes back as a jump from one side of
+        the image to the other - which draws as a spurious horizontal streak right
+        across the panorama. Unwrapping keeps the polyline continuous instead, and
+        lets the widget redraw it one period over to show the true re-entry."""
+        period = self._az_pixel_period()
+        if period is None or len(pts) < 2:
+            return pts
+        half = 0.5 * period
+        out = [pts[0]]
+        shift = 0.0
+        for px, py in pts[1:]:
+            prev_px = out[-1][0]
+            px += shift
+            while px - prev_px > half:
+                px -= period
+                shift -= period
+            while prev_px - px > half:
+                px += period
+                shift += period
+            out.append((px, py))
+        return out
+
     def _edge_arc_pixels(self, v0: Tuple[int, int], v1: Tuple[int, int],
                          n: int = 24) -> List[Tuple[float, float]]:
         """Trace the great-circle arc between two pixel vertices, returning a list
         of intermediate pixel points. This matches STVL's `isInside` edge semantics
-        (a half-plane test against the great circle through the two edge directions)."""
+        (a half-plane test against the great circle through the two edge directions).
+
+        Because edges are geodesics they always take the SHORT arc, so an edge whose
+        azimuth step exceeds pi sweeps the other way, across the 0/2pi seam. The
+        returned x coordinates are unwrapped (see `_unwrap_px`) so that arc stays a
+        continuous polyline instead of jumping across the image."""
         if self._cloud is None or self._az_col_x is None:
             return [(float(v0[0]), float(v0[1])), (float(v1[0]), float(v1[1]))]
         a0 = self._pixel_to_angular_model(v0[0], v0[1])
@@ -675,7 +718,7 @@ class MainWindow(QMainWindow):
         # Pin endpoints to the exact clicked pixels so arcs meet the drawn vertices.
         pts[0] = (float(v0[0]), float(v0[1]))
         pts[-1] = (float(v1[0]), float(v1[1]))
-        return pts
+        return self._unwrap_px(pts)
 
     def _on_save(self):
         if not self._range_widget.regions:

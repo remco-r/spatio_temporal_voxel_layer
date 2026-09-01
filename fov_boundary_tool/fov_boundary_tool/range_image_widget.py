@@ -65,6 +65,13 @@ class RangeImageWidget(QWidget):
         # outermost pixel row/column).
         self._oob_margin_frac = 0.02
 
+        # Width in pixels of a full 2pi azimuth turn, when the cloud covers a full
+        # panorama. Arc geometry is periodic in x with this period, so a region whose
+        # edge crosses the 0/2pi seam is also drawn one period to each side, showing
+        # it leave one edge of the image and re-enter the other. None for a partial
+        # FOV, which is not periodic and must not be replicated.
+        self._wrap_period: Optional[float] = None
+
     def set_image(self, image_data: np.ndarray):
         """Set the range image to display. Expects RGB uint8 array (H, W, 3)."""
         self._image_data = image_data
@@ -169,6 +176,18 @@ class RangeImageWidget(QWidget):
         self._show_arcs = show
         self.update()
 
+    def set_wrap_period(self, period: Optional[float]):
+        """Set the pixel period of a full 2pi azimuth turn, or None when the cloud is
+        not a full panorama and so must not be drawn wrapped."""
+        self._wrap_period = period
+        self.update()
+
+    def _wrap_offsets(self) -> List[float]:
+        """Image-space x offsets at which periodic arc geometry is redrawn."""
+        if self._wrap_period is None:
+            return [0.0]
+        return [-self._wrap_period, 0.0, self._wrap_period]
+
     def set_convexity_checker(self, fn: Optional[Callable[[List[Tuple[int, int]]], bool]]):
         """Provide a callback reporting whether a completed region (list of pixel
         vertices) is a valid convex half-plane cone. Used to flag non-convex
@@ -176,28 +195,55 @@ class RangeImageWidget(QWidget):
         self._is_convex_fn = fn
         self.update()
 
-    def _edge_widget_points(self, v0: Tuple[int, int],
-                            v1: Tuple[int, int]) -> List[QPointF]:
-        """Widget-space points along edge v0->v1, following the great-circle arc
-        if an interpolator is available, else a straight chord."""
+    def _edge_image_points(self, v0: Tuple[int, int],
+                           v1: Tuple[int, int]) -> List[Tuple[float, float]]:
+        """Image-space points along edge v0->v1, following the great-circle arc if an
+        interpolator is available, else a straight chord."""
         if self._show_arcs and self._edge_interp is not None:
             try:
-                img_pts = self._edge_interp(v0, v1)
+                return [(float(px), float(py)) for px, py in self._edge_interp(v0, v1)]
             except Exception:
-                img_pts = [v0, v1]
-        else:
-            img_pts = [v0, v1]
-        return [QPointF(*self._image_to_widget(px, py)) for px, py in img_pts]
+                pass
+        return [(float(v0[0]), float(v0[1])), (float(v1[0]), float(v1[1]))]
 
-    def _ring_polygon(self, verts: List[Tuple[int, int]]) -> QPolygonF:
-        """Build a closed QPolygonF tracing arcs around the vertex ring."""
-        poly = QPolygonF()
+    def _chained_image_points(self, verts: List[Tuple[int, int]],
+                              closed: bool) -> List[Tuple[float, float]]:
+        """One continuous image-space polyline along a vertex chain.
+
+        Each edge's arc is unwrapped independently, starting from its own first
+        vertex, so two consecutive edges can legitimately end up a whole azimuth turn
+        apart. Chain them here - shift every edge by whole periods so it continues
+        where the previous one ended - otherwise a seam-crossing ring would still
+        break at an edge junction even though no single edge does."""
         n = len(verts)
-        for i in range(n):
-            pts = self._edge_widget_points(verts[i], verts[(i + 1) % n])
-            for p in pts[:-1]:  # drop last to avoid duplicating shared vertices
-                poly.append(p)
-        return poly
+        edges = n if closed else n - 1
+        out: List[Tuple[float, float]] = []
+        prev_end: Optional[Tuple[float, float]] = None
+        for i in range(edges):
+            pts = self._edge_image_points(verts[i], verts[(i + 1) % n])
+            if self._wrap_period and prev_end is not None:
+                turns = round((pts[0][0] - prev_end[0]) / self._wrap_period)
+                if turns:
+                    pts = [(px - turns * self._wrap_period, py) for px, py in pts]
+            out.extend(pts[:-1])  # drop last to avoid duplicating shared vertices
+            prev_end = pts[-1]
+        if not closed and prev_end is not None:
+            out.append(prev_end)
+        return out
+
+    def _ring_polygons(self, verts: List[Tuple[int, int]]) -> List[QPolygonF]:
+        """Closed QPolygonFs tracing arcs around the vertex ring - one per wrap
+        offset, so a ring whose edges cross the 0/2pi seam is drawn leaving one side
+        of the panorama and re-entering the other, instead of as one streak straight
+        across it. Copies that fall entirely off-canvas simply do not show."""
+        ring = self._chained_image_points(verts, closed=True)
+        polys: List[QPolygonF] = []
+        for dx in self._wrap_offsets():
+            poly = QPolygonF()
+            for px, py in ring:
+                poly.append(QPointF(*self._image_to_widget(px + dx, py)))
+            polys.append(poly)
+        return polys
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -248,9 +294,9 @@ class RangeImageWidget(QWidget):
 
             # Draw filled polygon (edges follow great-circle arcs)
             if len(region) >= 3:
-                poly = self._ring_polygon(region)
                 painter.setBrush(QBrush(color))
-                painter.drawPolygon(poly)
+                for poly in self._ring_polygons(region):
+                    painter.drawPolygon(poly)
 
             # Draw vertices
             painter.setBrush(QBrush(vertex_color))
@@ -271,8 +317,8 @@ class RangeImageWidget(QWidget):
                     dc = decomp_colors[ci % len(decomp_colors)]
                     painter.setPen(QPen(dc.darker(100), 1.5, Qt.DashLine))
                     painter.setBrush(QBrush(dc))
-                    poly = self._ring_polygon(convex_poly)
-                    painter.drawPolygon(poly)
+                    for poly in self._ring_polygons(convex_poly):
+                        painter.drawPolygon(poly)
                     ci += 1
 
         # Draw current polygon being drawn
@@ -282,11 +328,13 @@ class RangeImageWidget(QWidget):
             painter.setBrush(Qt.NoBrush)
 
             # Draw edges (following great-circle arcs)
-            for i in range(len(self._current_vertices) - 1):
-                pts = self._edge_widget_points(
-                    self._current_vertices[i], self._current_vertices[i + 1])
-                for j in range(len(pts) - 1):
-                    painter.drawLine(pts[j], pts[j + 1])
+            if len(self._current_vertices) >= 2:
+                run = self._chained_image_points(self._current_vertices, closed=False)
+                for dx in self._wrap_offsets():
+                    pts = [QPointF(*self._image_to_widget(px + dx, py))
+                           for px, py in run]
+                    for j in range(len(pts) - 1):
+                        painter.drawLine(pts[j], pts[j + 1])
 
             # Draw closing line preview (last vertex -> mouse -> first vertex)
             if self._mouse_pos and len(self._current_vertices) >= 1:
