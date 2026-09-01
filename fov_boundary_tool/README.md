@@ -35,6 +35,22 @@ fov_boundary_tool
 6. **Save** to YAML file (coordinates in radians, sensor frame)
 7. **Load** previously saved configurations for editing
 
+## Reading what you have drawn
+
+Polygon edges are **great-circle arcs**, not straight lines in the range image, because
+that is what STVL's `isInside` half-plane test uses. The "Show Great-Circle Arcs" toggle
+(on by default) draws the real thing, so what you see is what will be masked. Two effects
+are worth recognising, both of which STVL accepts silently:
+
+- An edge spanning a wide range of azimuth **bows away from the equator**, reaching
+  `atan(tan(el) / cos(dAz / 2))` at its midpoint. Drawn on a narrow-vFOV panorama the arc
+  will visibly leave the top or bottom of the image. Keep each edge's azimuth step to
+  about 0.5 rad or less, and split a wide blind spot into several regions.
+- An edge whose azimuth step exceeds pi takes the short way round the **other** side, so
+  the region masks the complement of what it appears to enclose. Such an arc leaves one
+  side of the panorama and re-enters the far side; for a full 360 deg cloud the tool draws
+  that wrap, so the region shows up on both edges of the image.
+
 ## Output Format
 
 YAML file with convex polygons in spherical angular coordinates (azimuth, elevation) in radians:
