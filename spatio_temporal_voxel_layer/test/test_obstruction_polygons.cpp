@@ -340,6 +340,11 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsResolvesSeamSpanningPolygonToSho
   // free - a cone is the intersection of its edges' great-circle half-spaces,
   // and an intersection of half-spaces is convex by construction, so only the
   // short arc is representable. Nothing needs to detect or reject this.
+  //
+  // Note this polygon has the same signature as the over-wide band in
+  // ValidatePolygonsMasksComplementWhenAzimuthSpanExceedsPi - an azimuth extent well
+  // over pi - but the opposite intent. That is exactly why no extent-based rule can
+  // separate them, and why neither is rejected.
   geometry::AngularPolygon seam = {{6.2, -0.1}, {0.1, -0.1}, {0.1, 0.1}, {6.2, 0.1}};
   auto valid = geometry::validatePolygons({seam});
   ASSERT_EQ(valid.size(), 1u);
@@ -359,6 +364,122 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsResolvesSeamSpanningPolygonToSho
   // angular_area only orders polygons in flattenAndSortPolygons (largest first,
   // a hot-path early-out heuristic), so this costs ordering, never a wrong mask.
   EXPECT_NEAR(valid[0].angular_area, 1.22, 1e-9);
+}
+
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsMasksComplementWhenAzimuthSpanExceedsPi)
+{
+  // The trap. Edges are geodesics and take the short way, so once a band's azimuth
+  // span passes pi the short way is the OTHER way, across 0/2pi, and the cone covers
+  // the complement of what was written. Nothing rejects it: the complement band is
+  // itself a perfectly valid convex cone, so the convexity check passes.
+  //
+  // Pinned either side of the threshold. Do not "fix" this by rejecting wide spans -
+  // see the must-stay-accepted cases below, which are indistinguishable from it.
+  auto span = [](double s) {
+    return geometry::AngularPolygon{{0.05, -0.1}, {0.05 + s, -0.1}, {0.05 + s, 0.1}, {0.05, 0.1}};
+  };
+
+  const auto under = geometry::validatePolygons({span(3.1415)});
+  ASSERT_EQ(under.size(), 1u);
+  EXPECT_TRUE(isInsideCone(under[0].cone, {1.6, 0.0}));   // inside the written band
+  EXPECT_FALSE(isInsideCone(under[0].cone, {4.5, 0.0}));  // outside it
+
+  const auto over = geometry::validatePolygons({span(3.25)});
+  ASSERT_EQ(over.size(), 1u);
+  EXPECT_FALSE(isInsideCone(over[0].cone, {1.6, 0.0}));  // written band NOT masked
+  EXPECT_TRUE(isInsideCone(over[0].cone, {4.5, 0.0}));   // the complement is
+}
+
+TEST_F(ObstructionPolygonsTest, ConvexConeGeodesicEdgeBowsAwayFromTheEquator)
+{
+  // Even below pi the region is not the flat az/el box it looks like: a geodesic
+  // between two vertices at equal elevation bows away from the equator, reaching
+  // atan(tan(el) / cos(d_az / 2)). For el 0.1 over 3.0 rad of azimuth that peak is
+  // 0.957 rad, so a band drawn 0.1 tall masks out to ~55 deg of elevation.
+  const auto cone =
+    geometry::ConvexCone::fromAngularVertices({{0.0, -0.1}, {3.0, -0.1}, {3.0, 0.1}, {0.0, 0.1}});
+
+  const double peak = std::atan(std::tan(0.1) / std::cos(1.5));
+  EXPECT_NEAR(peak, 0.9567, 1e-4);
+
+  EXPECT_TRUE(isInsideCone(cone, {1.5, 0.0}));    // drawn interior
+  EXPECT_TRUE(isInsideCone(cone, {1.5, 0.5}));    // far above anything drawn
+  EXPECT_TRUE(isInsideCone(cone, {1.5, 0.90}));   // still inside, near the bow peak
+  EXPECT_FALSE(isInsideCone(cone, {1.5, 1.00}));  // just past it
+  EXPECT_FALSE(isInsideCone(cone, {4.0, 0.0}));   // outside the azimuth span
+}
+
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsSeamStraddlingBandAnExtentRuleWouldReject)
+{
+  // Guard rail for the test above. This band straddles 0/2pi, so its azimuth extent
+  // is 6.10 - far over pi - yet it is correct today and is exactly what the docs
+  // recommend for a blind spot sitting on sensor-forward. Any rule keyed on azimuth
+  // extent would reject the documented remedy, which is why none is applied.
+  const auto valid =
+    geometry::validatePolygons({{{6.2, -0.1}, {0.1, -0.1}, {0.1, 0.1}, {6.2, 0.1}}});
+  ASSERT_EQ(valid.size(), 1u);
+  EXPECT_TRUE(isInsideCone(valid[0].cone, {0.0, 0.0}));
+  EXPECT_TRUE(isInsideCone(valid[0].cone, {6.25, 0.0}));
+  EXPECT_FALSE(isInsideCone(valid[0].cone, {M_PI, 0.0}));
+}
+
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsPoleRingingPolygonAsZeroArea)
+{
+  // A real limitation, pinned so it is not mistaken for a bug in a future change:
+  // a cap around the nadir or zenith - masking straight down or straight up, e.g.
+  // the sensor's own mount - cannot be expressed at all. Ringing a pole means
+  // azimuth runs all the way round and back, which in the flat (az, el) domain that
+  // angularArea() measures is a retraced line, not a loop. Its shoelace area is zero
+  // whatever the elevations, so the minimum-area gate always rejects it. A zigzag in
+  // elevation does not help: the up and down triangles cancel exactly.
+  geometry::AngularPolygon flat_cap;
+  geometry::AngularPolygon zigzag_cap;
+  for (int i = 0; i < 6; ++i) {
+    const double az = i * 2.0 * M_PI / 6.0;
+    flat_cap.push_back({az, -1.4});
+    zigzag_cap.push_back({az, (i % 2 == 0) ? -1.4 : -1.2});
+  }
+  EXPECT_NEAR(geometry::angularArea(flat_cap), 0.0, 1e-12);
+  EXPECT_NEAR(geometry::angularArea(zigzag_cap), 0.0, 1e-12);
+  expectThrowsSaying(
+    [&flat_cap] { geometry::validatePolygons({flat_cap}); }, "near-zero angular area");
+  expectThrowsSaying(
+    [&zigzag_cap] { geometry::validatePolygons({zigzag_cap}); }, "near-zero angular area");
+}
+
+TEST_F(ObstructionPolygonsTest, SlicingAWideBandIntoStripsRestoresTheIntendedMask)
+{
+  // The documented remedy: express a wide blind spot as several narrow polygons.
+  // isObstructed is a union over polygons, so slicing is lossless - and each strip's
+  // edges are short enough that neither the flip nor the bow bites.
+  constexpr double kSpan = 4.0;
+  constexpr int kSlices = 8;
+  std::vector<geometry::AngularPolygon> strips;
+  for (int i = 0; i < kSlices; ++i) {
+    const double a0 = 0.05 + i * (kSpan / kSlices);
+    const double a1 = 0.05 + (i + 1) * (kSpan / kSlices);
+    strips.push_back({{a0, -0.1}, {a1, -0.1}, {a1, 0.1}, {a0, 0.1}});
+  }
+  const auto valid = geometry::validatePolygons(strips);
+  ASSERT_EQ(valid.size(), static_cast<size_t>(kSlices));
+
+  auto masked_by_any = [&valid](const geometry::SphericalPoint & p) {
+    for (const auto & v : valid) {
+      if (isInsideCone(v.cone, p)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // The written band is masked across its whole width, and only it.
+  EXPECT_TRUE(masked_by_any({0.10, 0.0}));
+  EXPECT_TRUE(masked_by_any({2.00, 0.0}));
+  EXPECT_TRUE(masked_by_any({3.90, 0.0}));
+  EXPECT_FALSE(masked_by_any({4.50, 0.0}));
+  EXPECT_FALSE(masked_by_any({6.00, 0.0}));
+  // And the bow is contained: nothing masked far above the 0.1 rad the strips span.
+  EXPECT_FALSE(masked_by_any({2.00, 0.5}));
 }
 
 TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsElevationBelowMinusHalfPi)
