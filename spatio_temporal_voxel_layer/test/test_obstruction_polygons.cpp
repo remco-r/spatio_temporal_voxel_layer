@@ -1,7 +1,7 @@
 /*********************************************************************
  * Tests for obstruction_polygons.hpp - 3D spherical half-plane
- * representation (SphericalPoint/AngularPolygon, ConvexCone,
- * ValidatedPolygon/validatePolygons, parsePolygonsFromString,
+ * representation (SphericalPoint/AngularPolygon, solidAngleFromNormals,
+ * ConvexCone, ValidatedPolygon/validatePolygons, parsePolygonsFromString,
  * ObstructionFilter).
  *
  * Parsing and validation are fail-fast: every rejection path throws
@@ -209,6 +209,30 @@ TEST_F(ObstructionPolygonsTest, ConvexConeAcceptsConvexSquareCw)
   EXPECT_EQ(cone.normals().size(), 4u);
 }
 
+TEST_F(ObstructionPolygonsTest, ConvexConeFlipMakesWindingIrrelevantToTheMask)
+{
+  // What the flip is for. A convex polygon's normals are all inward or all outward
+  // together - the sign follows the traversal, not the individual edge - so writing
+  // the corners the other way round yields the negated normal set, and isObstructed's
+  // "all dots non-negative" test would mask the exact complement if left uncorrected.
+  // One global negation is the whole fix, and the two windings must be indistinguishable.
+  const auto ccw = geometry::ConvexCone::fromAngularVertices(makeSquareCcw(1.0, -0.1, 1.2, 0.1));
+  const auto cw = geometry::ConvexCone::fromAngularVertices(makeSquareCw(1.0, -0.1, 1.2, 0.1));
+
+  EXPECT_NEAR(cw.getSolidAngle(), ccw.getSolidAngle(), 1e-15);
+  for (const auto & p : std::vector<geometry::SphericalPoint>{
+         {1.1, 0.0},     // interior
+         {1.0, -0.1},    // a corner
+         {1.5, 0.0},     // outside in azimuth
+         {1.1, 0.5},     // outside in elevation
+         {4.2, 0.0}}) {  // the antipode of the interior
+    EXPECT_EQ(isInsideCone(ccw, p), isInsideCone(cw, p))
+      << "winding changed the mask at az " << p.azimuth << " el " << p.elevation;
+  }
+  EXPECT_TRUE(isInsideCone(ccw, {1.1, 0.0}));
+  EXPECT_FALSE(isInsideCone(ccw, {4.2, 0.0}));
+}
+
 TEST_F(ObstructionPolygonsTest, ConvexConeNormalsPointInwardForAllVertices)
 {
   auto poly = makeSquareCcw(1.0, -0.1, 1.2, 0.1);
@@ -234,6 +258,38 @@ TEST_F(ObstructionPolygonsTest, ConvexConeRejectsDegenerateEdge)
   expectThrowsSaying(
     [&poly] { geometry::ConvexCone::fromAngularVertices(poly); },
     "degenerate edge between vertices 0 and 1");
+}
+
+TEST_F(ObstructionPolygonsTest, ConvexConeRejectsAntipodalEdgeAsDegenerate)
+{
+  // The degenerate-edge threshold is on |d_i x d_j|^2 = sin^2(arc), which vanishes at
+  // an arc of pi as well as 0. Two opposite directions lie on one line through the
+  // sensor, and a line does not define a plane, so the edge has no half-space to
+  // contribute - infinitely many great circles pass through both, all the same length.
+  // Same rejection as a duplicated vertex, and the message says so.
+  expectThrowsSaying(
+    [] { geometry::ConvexCone::fromAngularVertices({{0.0, 0.0}, {M_PI, 0.0}, {0.5, 0.3}}); },
+    "the two directions are coincident or 180 deg apart");
+}
+
+TEST_F(ObstructionPolygonsTest, ConvexConeRejectsVertexDirectionsThatCancelOut)
+{
+  // Orientation is decided against the summed vertex directions, which only lands
+  // inside the cone while the vertices fit within one hemisphere. Spread them evenly
+  // around a great circle and the sum is the zero vector: there is no interior
+  // direction to reference, so there is nothing to orient against.
+  expectThrowsSaying(
+    [] {
+      geometry::ConvexCone::fromAngularVertices(
+        {{0.0, 0.0}, {2.0 * M_PI / 3.0, 0.0}, {4.0 * M_PI / 3.0, 0.0}});
+    },
+    "has vertex directions that cancel out");
+  expectThrowsSaying(
+    [] {
+      geometry::ConvexCone::fromAngularVertices(
+        {{0.0, 0.0}, {M_PI_2, 0.0}, {M_PI, 0.0}, {3.0 * M_PI_2, 0.0}});
+    },
+    "has vertex directions that cancel out");
 }
 
 TEST_F(ObstructionPolygonsTest, ConvexConeRejectsNonConvexPolygon)
@@ -278,20 +334,77 @@ TEST_F(ObstructionPolygonsTest, ConvexConeAcceptsPolygonAtHighElevation)
 }
 
 // ============================================================
-// angularArea tests
+// solidAngleFromNormals tests
 // ============================================================
+//
+// Girard's theorem: the interior angles of a spherical polygon exceed the flat
+// (n-2)*pi by exactly the area it covers, which reduces to
+// 2*pi - sum(acos(n[i] . n[i+1])) over the edge-plane normals. Exercised here on
+// hand-written normals, so the arithmetic is pinned independently of whether any
+// (az, el) polygon can produce those normals.
 
-TEST_F(ObstructionPolygonsTest, AngularAreaComputesShoelaceAreaForSquare)
+TEST_F(ObstructionPolygonsTest, SolidAngleFromNormalsMeasuresOneOctant)
 {
-  auto poly = makeSquareCcw(1.0, -0.1, 1.2, 0.1);
-  EXPECT_NEAR(geometry::angularArea(poly), 0.04, 1e-9);
+  // The reference case, exact and derivable without measurement: the triangle
+  // spanning the x, y and z axes is one eighth of the sphere, so 4*pi/8 = pi/2.
+  // Its three edge planes are the coordinate planes, so the normals are the axes.
+  const std::vector<geometry::Vec3D> axes = {{0.0, 0.0, 1.0}, {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}};
+  EXPECT_NEAR(geometry::solidAngleFromNormals(axes), M_PI_2, 1e-12);
 }
 
-TEST_F(ObstructionPolygonsTest, AngularAreaIndependentOfWindingDirection)
+TEST_F(ObstructionPolygonsTest, SolidAngleFromNormalsIsIndependentOfNormalSign)
 {
-  auto ccw = makeSquareCcw(1.0, -0.1, 1.2, 0.1);
-  auto cw = makeSquareCw(1.0, -0.1, 1.2, 0.1);
-  EXPECT_NEAR(geometry::angularArea(ccw), geometry::angularArea(cw), 1e-9);
+  // Each term is a dot product between two normals, so negating every normal
+  // leaves every term unchanged. That is why this measures a polygon's size
+  // without settling its winding, and why it can run either side of the flip.
+  std::vector<geometry::Vec3D> axes = {{0.0, 0.0, 1.0}, {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}};
+  const double as_written = geometry::solidAngleFromNormals(axes);
+  for (auto & n : axes) {
+    n = {-n.x, -n.y, -n.z};
+  }
+  EXPECT_NEAR(geometry::solidAngleFromNormals(axes), as_written, 1e-15);
+}
+
+TEST_F(ObstructionPolygonsTest, SolidAngleFromNormalsReportsHemisphereWhenAllNormalsAreParallel)
+{
+  // Every edge sharing one plane means the cone is a single half-space, i.e. a
+  // hemisphere, 2*pi sr. This is the shape that used to slip through: the chart
+  // shoelace saw a healthy area and the convexity check was vacuous, so the mask
+  // silently swallowed half the sensor's view. Here it is simply a number, which
+  // is what lets fromAngularVertices reject it.
+  const std::vector<geometry::Vec3D> parallel = {{0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}};
+  EXPECT_NEAR(geometry::solidAngleFromNormals(parallel), 2.0 * M_PI, 1e-12);
+}
+
+TEST_F(ObstructionPolygonsTest, SolidAngleFromNormalsReportsZeroWhenOneNormalIsAntiparallel)
+{
+  // The other flat case: the wedge is pinched shut and encloses nothing.
+  const std::vector<geometry::Vec3D> pinched = {{0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, -1.0}};
+  EXPECT_NEAR(geometry::solidAngleFromNormals(pinched), 0.0, 1e-12);
+}
+
+TEST_F(ObstructionPolygonsTest, SolidAngleMatchesSmallPatchApproximation)
+{
+  // A patch small enough to be near-flat should come out at width * height *
+  // cos(el) - the cos factor being exactly what a flat (az, el) area misses.
+  constexpr double kAz = 0.2;
+  constexpr double kEl = 0.15;
+  constexpr double kCentre = 0.6;
+  const auto cone = geometry::ConvexCone::fromAngularVertices(
+    {{1.0, kCentre - kEl / 2},
+     {1.0 + kAz, kCentre - kEl / 2},
+     {1.0 + kAz, kCentre + kEl / 2},
+     {1.0, kCentre + kEl / 2}});
+  EXPECT_NEAR(cone.getSolidAngle(), kAz * kEl * std::cos(kCentre), 1e-3);
+}
+
+TEST_F(ObstructionPolygonsTest, ConvexConeReportsSolidAngleForOctantTriangle)
+{
+  // Same reference case, but driven from (az, el) through the whole pipeline, so
+  // the vertex-to-direction conversion and the normal construction are covered too.
+  const auto cone =
+    geometry::ConvexCone::fromAngularVertices({{0.0, 0.0}, {M_PI_2, 0.0}, {0.0, M_PI_2}});
+  EXPECT_NEAR(cone.getSolidAngle(), M_PI_2, 1e-12);
 }
 
 // ============================================================
@@ -359,11 +472,12 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsResolvesSeamSpanningPolygonToSho
   EXPECT_FALSE(isInsideCone(valid[0].cone, {0.2, 0.0}));
   EXPECT_FALSE(isInsideCone(valid[0].cone, {6.0, 0.0}));
 
-  // The stored area, however, is the shoelace of the raw angular values, which
-  // the seam inflates to ~1.22 against a true masked solid angle of ~0.037 sr.
-  // angular_area only orders polygons in flattenAndSortPolygons (largest first,
-  // a hot-path early-out heuristic), so this costs ordering, never a wrong mask.
-  EXPECT_NEAR(valid[0].angular_area, 1.22, 1e-9);
+  // The stored size is the solid angle the cone really covers, ~0.037 sr. A flat
+  // shoelace over the raw angular values read 1.22 here, inflated 33x by the seam
+  // jump from 6.2 to 0.1, which mis-sorted this tiny polygon ahead of far larger
+  // ones in flattenAndSortPolygons. Measuring on the sphere removes the seam's
+  // effect entirely - see SolidAngleOrdersSeamPolygonBelowAGenuinelyLargerOne.
+  EXPECT_NEAR(valid[0].solid_angle, 0.036678, 1e-6);
 }
 
 TEST_F(ObstructionPolygonsTest, ValidatePolygonsMasksComplementWhenAzimuthSpanExceedsPi)
@@ -375,11 +489,16 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsMasksComplementWhenAzimuthSpanEx
   //
   // Pinned either side of the threshold. Do not "fix" this by rejecting wide spans -
   // see the must-stay-accepted cases below, which are indistinguishable from it.
+  //
+  // The band has to be thin in elevation to reach this at all now. Combined with a
+  // near-pi azimuth span, a 0.1 rad tall band bows almost to the pole and trips the
+  // solid-angle cap instead - covered by ConvexConeRejectsBandWhoseBowMakesItEnormous.
   auto span = [](double s) {
-    return geometry::AngularPolygon{{0.05, -0.1}, {0.05 + s, -0.1}, {0.05 + s, 0.1}, {0.05, 0.1}};
+    return geometry::AngularPolygon{
+      {0.05, -0.01}, {0.05 + s, -0.01}, {0.05 + s, 0.01}, {0.05, 0.01}};
   };
 
-  const auto under = geometry::validatePolygons({span(3.1415)});
+  const auto under = geometry::validatePolygons({span(3.1)});
   ASSERT_EQ(under.size(), 1u);
   EXPECT_TRUE(isInsideCone(under[0].cone, {1.6, 0.0}));   // inside the written band
   EXPECT_FALSE(isInsideCone(under[0].cone, {4.5, 0.0}));  // outside it
@@ -394,19 +513,32 @@ TEST_F(ObstructionPolygonsTest, ConvexConeGeodesicEdgeBowsAwayFromTheEquator)
 {
   // Even below pi the region is not the flat az/el box it looks like: a geodesic
   // between two vertices at equal elevation bows away from the equator, reaching
-  // atan(tan(el) / cos(d_az / 2)). For el 0.1 over 3.0 rad of azimuth that peak is
-  // 0.957 rad, so a band drawn 0.1 tall masks out to ~55 deg of elevation.
+  // atan(tan(el) / cos(d_az / 2)).
   const auto cone =
-    geometry::ConvexCone::fromAngularVertices({{0.0, -0.1}, {3.0, -0.1}, {3.0, 0.1}, {0.0, 0.1}});
+    geometry::ConvexCone::fromAngularVertices({{0.0, -0.1}, {2.8, -0.1}, {2.8, 0.1}, {0.0, 0.1}});
 
-  const double peak = std::atan(std::tan(0.1) / std::cos(1.5));
-  EXPECT_NEAR(peak, 0.9567, 1e-4);
+  // For el 0.1 over 2.8 rad of azimuth that peak is 0.5333 rad, so a band drawn
+  // 0.1 tall masks out to ~31 deg of elevation.
+  const double peak = std::atan(std::tan(0.1) / std::cos(1.4));
+  EXPECT_NEAR(peak, 0.5333, 1e-4);
 
-  EXPECT_TRUE(isInsideCone(cone, {1.5, 0.0}));    // drawn interior
-  EXPECT_TRUE(isInsideCone(cone, {1.5, 0.5}));    // far above anything drawn
-  EXPECT_TRUE(isInsideCone(cone, {1.5, 0.90}));   // still inside, near the bow peak
-  EXPECT_FALSE(isInsideCone(cone, {1.5, 1.00}));  // just past it
+  EXPECT_TRUE(isInsideCone(cone, {1.4, 0.0}));    // drawn interior
+  EXPECT_TRUE(isInsideCone(cone, {1.4, 0.3}));    // far above anything drawn
+  EXPECT_TRUE(isInsideCone(cone, {1.4, 0.50}));   // still inside, near the bow peak
+  EXPECT_FALSE(isInsideCone(cone, {1.4, 0.60}));  // just past it
   EXPECT_FALSE(isInsideCone(cone, {4.0, 0.0}));   // outside the azimuth span
+}
+
+TEST_F(ObstructionPolygonsTest, ConvexConeRejectsBandWhoseBowMakesItEnormous)
+{
+  // Same band 0.2 rad wider in azimuth. Nothing about the written numbers looks
+  // alarming - 0.2 rad of elevation - but the bowed geodesics carry it to 3.81 sr,
+  // over a quarter of the sphere, so it is rejected rather than masking that much.
+  expectThrowsSaying(
+    [] {
+      geometry::ConvexCone::fromAngularVertices({{0.0, -0.1}, {3.0, -0.1}, {3.0, 0.1}, {0.0, 0.1}});
+    },
+    "far too large for a blind spot");
 }
 
 TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsSeamStraddlingBandAnExtentRuleWouldReject)
@@ -423,28 +555,44 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsSeamStraddlingBandAnExten
   EXPECT_FALSE(isInsideCone(valid[0].cone, {M_PI, 0.0}));
 }
 
-TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsPoleRingingPolygonAsZeroArea)
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsPoleRingingCap)
 {
-  // A real limitation, pinned so it is not mistaken for a bug in a future change:
-  // a cap around the nadir or zenith - masking straight down or straight up, e.g.
-  // the sensor's own mount - cannot be expressed at all. Ringing a pole means
-  // azimuth runs all the way round and back, which in the flat (az, el) domain that
-  // angularArea() measures is a retraced line, not a loop. Its shoelace area is zero
-  // whatever the elevations, so the minimum-area gate always rejects it. A zigzag in
-  // elevation does not help: the up and down triangles cancel exactly.
-  geometry::AngularPolygon flat_cap;
-  geometry::AngularPolygon zigzag_cap;
+  // A cap around the nadir or zenith - masking straight down or straight up, e.g. the
+  // sensor's own mount - used to be impossible. Ringing a pole means azimuth runs all
+  // the way round, which the old flat (az, el) shoelace read as a retraced line with
+  // zero area, so the minimum-area gate rejected it however the elevations were
+  // written. Measuring the cone itself has no such blind spot: a hexagon inscribed in
+  // a cap 0.17 rad from the south pole is an ordinary convex cone of 0.0759 sr.
+  //
+  // Note most +-20-40 elevation deg lidars cannot see a pole at all - the frustum's
+  // vFOV check discards those directions first - so this only becomes reachable on a
+  // wide-angle sensor.
+  geometry::AngularPolygon cap;
   for (int i = 0; i < 6; ++i) {
-    const double az = i * 2.0 * M_PI / 6.0;
-    flat_cap.push_back({az, -1.4});
-    zigzag_cap.push_back({az, (i % 2 == 0) ? -1.4 : -1.2});
+    cap.push_back({i * 2.0 * M_PI / 6.0, -1.4});
   }
-  EXPECT_NEAR(geometry::angularArea(flat_cap), 0.0, 1e-12);
-  EXPECT_NEAR(geometry::angularArea(zigzag_cap), 0.0, 1e-12);
+  const auto valid = geometry::validatePolygons({cap});
+  ASSERT_EQ(valid.size(), 1u);
+  EXPECT_NEAR(valid[0].solid_angle, 0.075880, 1e-6);
+
+  // It masks the pole it rings and nothing near the equator.
+  EXPECT_TRUE(isInsideCone(valid[0].cone, {0.0, -M_PI_2}));
+  EXPECT_TRUE(isInsideCone(valid[0].cone, {3.0, -1.45}));
+  EXPECT_FALSE(isInsideCone(valid[0].cone, {0.0, 0.0}));
+  EXPECT_FALSE(isInsideCone(valid[0].cone, {0.0, -1.0}));
+}
+
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsPoleRingingCapThatZigzagsInElevation)
+{
+  // Alternating elevations around the pole makes a star, not a cap: the vertices at
+  // el -1.2 sit further from the pole than those at -1.4, so the outline has reflex
+  // corners.
+  geometry::AngularPolygon zigzag;
+  for (int i = 0; i < 6; ++i) {
+    zigzag.push_back({i * 2.0 * M_PI / 6.0, (i % 2 == 0) ? -1.4 : -1.2});
+  }
   expectThrowsSaying(
-    [&flat_cap] { geometry::validatePolygons({flat_cap}); }, "near-zero angular area");
-  expectThrowsSaying(
-    [&zigzag_cap] { geometry::validatePolygons({zigzag_cap}); }, "near-zero angular area");
+    [&zigzag] { geometry::validatePolygons({zigzag}); }, "is not spherically convex");
 }
 
 TEST_F(ObstructionPolygonsTest, SlicingAWideBandIntoStripsRestoresTheIntendedMask)
@@ -507,18 +655,65 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsElevationAtRangeBoundarie
   EXPECT_NO_THROW(geometry::validatePolygons({apex_down}));
 }
 
-TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsCollinearZeroAreaPolygon)
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsChartCollinearVerticesAsAThinSliver)
 {
-  // Three points on one line in the angular domain: masks nothing, so it is
-  // rejected by the minimum-angular-area check before reaching ConvexCone.
+  // BEHAVIOUR CHANGE, pinned deliberately. These three points are collinear in the
+  // flat (az, el) chart, so the old shoelace gate called them zero-area and rejected
+  // them. On the sphere they are not degenerate at all - a straight line in the chart
+  // is not a great circle - so they bound a real, if very thin, cone of 3.8e-5 sr.
+  //
+  // It is accepted because kMinSolidAngle (1e-9 sr) exists to catch cones that
+  // enclose nothing, not to second-guess small ones. If chart-collinear vertices
+  // should instead be treated as a likely typo, that is a threshold decision:
+  // raising kMinSolidAngle to ~1e-4 sr would reject this while leaving every
+  // realistic mask (a 30x20 deg mast is 0.19 sr) untouched.
   geometry::AngularPolygon poly = {{1.0, 0.0}, {1.1, 0.05}, {1.2, 0.1}};
-  expectThrowsSaying([&poly] { geometry::validatePolygons({poly}); }, "near-zero angular area");
+  const auto valid = geometry::validatePolygons({poly});
+  ASSERT_EQ(valid.size(), 1u);
+  EXPECT_GT(valid[0].solid_angle, 0.00001);
 }
 
-TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsCoincidentZeroAreaPolygon)
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsCoincidentVerticesAsADegenerateEdge)
 {
+  // A duplicated vertex used to be caught by the area gate. It is now caught one
+  // step later, by the degenerate-edge check, which names the two vertices - a
+  // strictly more useful message for the same input.
   auto poly = makeTriangleWithDuplicateVertex();
-  expectThrowsSaying([&poly] { geometry::validatePolygons({poly}); }, "near-zero angular area");
+  expectThrowsSaying(
+    [&poly] { geometry::validatePolygons({poly}); },
+    "obstruction polygon 0 has a degenerate edge between vertices 0 and 1");
+}
+
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsVerticesOnASingleGreatCircle)
+{
+  // The shape the old chart gate could not see and the convexity check could not
+  // judge: every vertex on one great circle through the sensor. The cone is flat, so
+  // every vertex lies in every edge plane, every dot product is zero, and the
+  // convexity loop proves nothing. Both sub-cases were accepted before this check.
+  //
+  // Vertices are placed on a 45 deg inclined great circle, el = atan(sin(az)), which
+  // is a sinusoid in the chart - not a straight line - so the old shoelace read a
+  // healthy area for it.
+  auto onGreatCircle = [](double az_deg) {
+    const double az = az_deg * M_PI / 180.0;
+    return geometry::SphericalPoint{az, std::atan(std::sin(az))};
+  };
+
+  // Spread over more than half the circle: all normals end up parallel, so the cone
+  // is a half-space. This one used to mask an entire hemisphere in silence.
+  geometry::AngularPolygon wrapping = {
+    onGreatCircle(0.0), onGreatCircle(120.0), onGreatCircle(240.0)};
+  expectThrowsSaying(
+    [&wrapping] { geometry::validatePolygons({wrapping}); },
+    "every vertex lies on one great circle through the sensor");
+
+  // Spread over less than half: one normal is antiparallel and the cone is pinched
+  // shut, so it used to be accepted while masking nothing.
+  geometry::AngularPolygon pinched = {
+    onGreatCircle(0.0), onGreatCircle(90.0), onGreatCircle(170.0)};
+  expectThrowsSaying(
+    [&pinched] { geometry::validatePolygons({pinched}); },
+    "every vertex lies on one great circle through the sensor");
 }
 
 TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsDegenerateEdgeWithNonZeroArea)
@@ -543,7 +738,10 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsGoodPolygon)
 {
   auto valid = geometry::validatePolygons({makeSquareCcw(1.0, -0.1, 1.2, 0.1)});
   ASSERT_EQ(valid.size(), 1u);
-  EXPECT_NEAR(valid[0].angular_area, 0.04, 1e-9);
+  // 0.2 x 0.2 rad astride the equator, so the solid angle is just over the 0.04 a
+  // flat area would give - the geodesic edges bow outward slightly.
+  EXPECT_GT(valid[0].solid_angle, 0.04);
+  EXPECT_NEAR(valid[0].solid_angle, 0.041, 0.001);
   EXPECT_EQ(valid[0].cone.normals().size(), 4u);
 }
 
@@ -552,8 +750,29 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsMultipleGoodPolygons)
   auto valid = geometry::validatePolygons(
     {makeSquareCcw(1.0, -0.1, 1.2, 0.1), makeSquareCcw(2.0, -0.1, 2.4, 0.1), makeTriangle()});
   ASSERT_EQ(valid.size(), 3u);
-  EXPECT_NEAR(valid[0].angular_area, 0.04, 1e-9);
-  EXPECT_NEAR(valid[1].angular_area, 0.08, 1e-9);
+  EXPECT_GT(valid[0].solid_angle, 0.2 * 0.2);
+  EXPECT_GT(valid[1].solid_angle, 0.4 * 0.2);
+  EXPECT_GT(valid[2].solid_angle, 0.01);
+}
+
+TEST_F(ObstructionPolygonsTest, SolidAngleOrdersSeamPolygonBelowAGenuinelyLargerOne)
+{
+  // flattenAndSortPolygons orders polygons largest-first so isObstructed's early-out
+  // hits sooner, and the key it sorts on used to be the flat chart shoelace. That key
+  // was wrong by a wide margin for a seam-straddling polygon: the jump from az 6.2 to
+  // 0.1 reads as 6.1 rad of extent, inflating a 0.037 sr sliver to 1.22 and sorting it
+  // ahead of every genuinely larger mask. The solid angle has no seam to trip over.
+  //
+  // The filter's own spans are private, so this pins the key rather than reaching into
+  // the ordering: what mattered was which of the two numbers is larger, and it flipped.
+  geometry::AngularPolygon seam = {{6.2, -0.1}, {0.1, -0.1}, {0.1, 0.1}, {6.2, 0.1}};
+  geometry::AngularPolygon larger = makeSquareCcw(2.0, -0.1, 2.4, 0.1);
+
+  const auto valid = geometry::validatePolygons({seam, larger});
+  ASSERT_EQ(valid.size(), 2u);
+  EXPECT_NEAR(valid[0].solid_angle, 0.036, 1e-3);  // chart shoelace read 1.22
+  EXPECT_NEAR(valid[1].solid_angle, 0.081, 1e-3);  // chart shoelace read 0.08
+  EXPECT_GT(valid[1].solid_angle, valid[0].solid_angle);
 }
 
 TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsWholeSetWhenAnyPolygonInvalid)
