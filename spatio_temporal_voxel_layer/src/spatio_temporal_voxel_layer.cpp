@@ -174,6 +174,7 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
     double min_z, max_z, vFOV, vFOVPadding;
     double hFOV, decay_acceleration, obstacle_range;
     std::string topic, sensor_frame, data_type, filter_str, obstruction_polygons;
+    std::vector<double> obstruction_min_ranges;
     bool inf_is_valid = false, clearing, marking;
     bool clear_after_reading, enabled;
     int voxel_min_points;
@@ -207,6 +208,9 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
     declareParameter(
       source + "." + "obstruction_polygons",
       rclcpp::ParameterValue(std::string("")));
+    declareParameter(
+      source + "." + "obstruction_min_ranges",
+      rclcpp::ParameterValue(std::vector<double>{}));
 
     node->get_parameter(name_ + "." + source + "." + "topic", topic);
     node->get_parameter(name_ + "." + source + "." + "sensor_frame", sensor_frame);
@@ -250,6 +254,16 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
     ModelType model_type = static_cast<ModelType>(model_type_int);
     // optional obstruction polygons string in az/el, used to persist voxels behind obstructions
     node->get_parameter(name_ + "." + source + "." + "obstruction_polygons", obstruction_polygons);
+    // optional per-polygon range to the obstruction, so voxels in front of it are still cleared
+    try {
+      node->get_parameter(
+        name_ + "." + source + "." + "obstruction_min_ranges", obstruction_min_ranges);
+    } catch (const rclcpp::exceptions::InvalidParameterTypeException & e) {
+      throw std::runtime_error(
+              "Invalid '" + name_ + "." + source +
+              ".obstruction_min_ranges'. should look like [0.0, 2.5] (with decimal points)"
+              + e.what());
+    }
 
     if (filter_str == "passthrough") {
       RCLCPP_INFO(logger_, "Passthough filter activated.");
@@ -281,7 +295,8 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
 
     // Load obstruction polygons for 3D lidar sources
     if (model_type == THREE_DIMENSIONAL_LIDAR) {
-      auto obstruction_filter = geometry::ObstructionFilter::fromParam(obstruction_polygons);
+      auto obstruction_filter =
+        geometry::ObstructionFilter::fromParam(obstruction_polygons, obstruction_min_ranges);
       if (obstruction_filter) {
         RCLCPP_INFO(
           logger_,

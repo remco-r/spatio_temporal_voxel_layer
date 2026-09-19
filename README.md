@@ -170,9 +170,11 @@ In case you want to use the 3D lidar model with defined obstructions (e.g., robo
     vertical_fov_angle: 1.57     #90 deg
     obstacle_range: 20.0         #should be large enough to clear further than marking range, and further than voxels that may have been retained behind obstructions while robot moved.
     obstruction_polygons: "[[0.8,-0.2, 1.2,-0.2, 1.2,0.1, 0.8,0.1], [3.5,-0.3, 4.0,-0.3, 4.0,0.0, 3.5,0.0]]"
+    obstruction_min_ranges: [0.5, 2.5]
 ```
 
 Each inner bracket `[az1,el1, az2,el2, ...]` defines one convex polygon (minimum 3 vertices, azimuth in [0, 2π] radians, elevation in [-π/2, π/2] radians). If empty or unset, behavior is identical to the original STVL. Only applies to `model_type: 1`.
+`obstrcution_min_ranges` indicates range before the obstruction in which clearing can still take place.
 
 #### Edges are great-circle arcs, not az/el straight lines
 

@@ -295,16 +295,37 @@ private:
 struct ValidatedPolygon
 {
   double solid_angle;  // steradians, for size based sorting
+  double min_range;    // meter. for clearing points between sensor and obstruction
   ConvexCone cone;
 };
 
 /**
  * @brief Perform validity checks for each polygon
- * @return vector of valid, precomputed polygons paired with their solid angle
- * @throws std::runtime_error on the first invalid polygon
+ * @param min_ranges empty, or exactly one value per polygon in the same order
+ * @return vector of valid, precomputed polygons paired with their solid angle and min range
+ * @throws std::runtime_error on the first invalid polygon, or on a min_ranges count that is
+ *         neither empty nor the number of polygons
  */
-inline std::vector<ValidatedPolygon> validatePolygons(const std::vector<AngularPolygon> & input)
+inline std::vector<ValidatedPolygon> validatePolygons(
+  const std::vector<AngularPolygon> & input, const std::vector<double> & min_ranges = {})
 {
+  // Either a range for every polygon or none at all. Any other count is a mismatch only the
+  // operator can resolve: padding or truncating would silently attach a range to the wrong
+  // polygon, and so stop clearing the wrong part of the sensor's view.
+  if (!min_ranges.empty() && min_ranges.size() != input.size()) {
+    throw std::runtime_error(
+            "obstruction_min_ranges has " + std::to_string(min_ranges.size()) +
+            " values, needs " + std::to_string(input.size()) +
+            " (one per polygon) or none at all");
+  }
+  for (const double range : min_ranges) {
+    if (!std::isfinite(range) || range < 0.0) {
+      throw std::runtime_error(
+              "obstruction_min_ranges has value " + std::to_string(range) +
+              ", needs to be finite and non-negative");
+    }
+  }
+
   std::vector<ValidatedPolygon> valid;
   valid.reserve(input.size());
 
@@ -336,11 +357,14 @@ inline std::vector<ValidatedPolygon> validatePolygons(const std::vector<AngularP
       }
     }
 
+    // Unset means zero, i.e. the obstruction hides its whole ray
+    const double min_range = min_ranges.empty() ? 0.0 : min_ranges[idx];
+
     // Shape and size are checked on the sphere by fromAngularVertices, which rejects a cone
     // that is degenerate, non-convex or implausibly large.
     try {
       ConvexCone cone = ConvexCone::fromAngularVertices(vertices);
-      valid.push_back({cone.getSolidAngle(), std::move(cone)});
+      valid.push_back({cone.getSolidAngle(), min_range, std::move(cone)});
     } catch (const std::exception & e) {
       throw std::runtime_error(poly_name_idx + " " + e.what());
     }
@@ -456,9 +480,16 @@ public:
     const float * ny = ny_.data();
     const float * nz = nz_.data();
 
+    // An obstruction only hides what lies behind it. The segment between the sensor and the
+    // occlusion is still observed, so a point nearer than the occlusion has to stay clearable.
+    const float range_sq = x * x + y * y + z * z;
+
     // to be obstructed (in polygon), each dot product of direction with polygon normals should
     // be positive. If there is any negative dot product, this direction is not obstructed
     for (const auto & span : polygons_) {
+      if (range_sq < span.min_range_sq) {
+        continue;  // in front of this occlusion; another polygon may still hide the point
+      }
       const uint32_t end = span.start + span.count;
       int any_negative = 0;
       for (uint32_t i = span.start; i < end; ++i) {
@@ -473,13 +504,16 @@ public:
   }
 
   /**
-   * @brief Parse obstruction polygons from a single ROS2 string parameter.
+   * @brief Build the filter from the obstruction polygon parameters.
    *
-   * Expected parameter format (footprint-style):
-   *   obstruction_polygons: "[[x1,y1, x2,y2, x3,y3], [x4,y4, x5,y5, x6,y6]]"
-   *   x=azimuth (rad), y=elevation (rad).
+   * Expected parameter formats:
+   *   obstruction_polygons:   "[[x1,y1, x2,y2, x3,y3], [x4,y4, x5,y5, x6,y6]]"
+   *     x=azimuth (rad), y=elevation (rad).
+   *   obstruction_min_ranges: [0.5, 2.5]
+   *     meter from the sensor to each obstruction, in the same order as the polygons.
    */
-  static std::shared_ptr<ObstructionFilter> fromParam(const std::string & polygons_param)
+  static std::shared_ptr<ObstructionFilter> fromParam(
+    const std::string & polygons_param, const std::vector<double> & min_ranges = {})
   {
     if (polygons_param.empty()) {
       return nullptr;
@@ -487,9 +521,11 @@ public:
 
     std::vector<ValidatedPolygon> valid_polygons;
     try {
-      valid_polygons = validatePolygons(parsePolygonsFromString(polygons_param));
+      valid_polygons = validatePolygons(parsePolygonsFromString(polygons_param), min_ranges);
     } catch (const std::exception & e) {
-      throw std::runtime_error("Invalid polygon: '" + polygons_param + "'. " + e.what());
+      throw std::runtime_error(
+              "Invalid obstruction configuration. obstruction_polygons: '" + polygons_param +
+              "'. " + e.what());
     }
 
     auto obstruction_filter = std::make_shared<ObstructionFilter>();
@@ -503,6 +539,7 @@ private:
   {
     uint32_t start;
     uint32_t count;
+    float min_range_sq;
   };
 
   // Flat, contiguous Structure-of-Arrays (SoA) storage of all obstruction
@@ -542,6 +579,7 @@ private:
       Span span;
       span.start = static_cast<uint32_t>(nx_.size());
       span.count = static_cast<uint32_t>(poly->cone.normals().size());
+      span.min_range_sq = static_cast<float>(poly->min_range * poly->min_range);
       for (const auto & normal : poly->cone.normals()) {
         nx_.push_back(static_cast<float>(normal.x));
         ny_.push_back(static_cast<float>(normal.y));
