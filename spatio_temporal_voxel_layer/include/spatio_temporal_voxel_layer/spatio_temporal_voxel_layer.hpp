@@ -166,6 +166,16 @@ private:
   rcl_interfaces::msg::SetParametersResult
     dynamicParametersCallback(std::vector<rclcpp::Parameter> parameters);
 
+  /**
+   * @brief Rebuild one source's obstruction filter from a pending parameter change.
+   *
+   * @param source observation source name to update
+   * @param parameters the pending parameter change
+   * @return whether the parameter update was successful
+   */
+  rcl_interfaces::msg::SetParametersResult updateObstructionFilter(
+    const std::string & source, const std::vector<rclcpp::Parameter> & parameters);
+
   laser_geometry::LaserProjection _laser_projector;
   std::vector<std::shared_ptr<message_filters::SubscriberBase<rclcpp_lifecycle::LifecycleNode>>>
     _observation_subscribers;

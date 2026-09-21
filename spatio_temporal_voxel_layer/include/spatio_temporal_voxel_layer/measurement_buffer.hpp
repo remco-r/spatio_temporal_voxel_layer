@@ -128,6 +128,9 @@ public:
   // Source name getter
   std::string GetSourceName(void) const;
 
+  // Frustum model this source uses
+  ModelType GetModelType(void) const;
+
   // params setters
   void SetMinObstacleHeight(const double & min_obstacle_height);
   void SetMaxObstacleHeight(const double & max_obstacle_height);

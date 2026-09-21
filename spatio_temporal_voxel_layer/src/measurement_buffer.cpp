@@ -284,6 +284,13 @@ std::string MeasurementBuffer::GetSourceName(void) const
 }
 
 /*****************************************************************************/
+ModelType MeasurementBuffer::GetModelType(void) const
+/*****************************************************************************/
+{
+  return _model_type;
+}
+
+/*****************************************************************************/
 void MeasurementBuffer::SetMinObstacleHeight(const double & min_obstacle_height)
 /*****************************************************************************/
 {
