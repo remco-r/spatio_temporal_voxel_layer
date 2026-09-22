@@ -171,6 +171,7 @@ In case you want to use the 3D lidar model with defined obstructions (e.g., robo
     obstacle_range: 20.0         #should be large enough to clear further than marking range, and further than voxels that may have been retained behind obstructions while robot moved.
     obstruction_polygons: "[[0.8,-0.2, 1.2,-0.2, 1.2,0.1, 0.8,0.1], [3.5,-0.3, 4.0,-0.3, 4.0,0.0, 3.5,0.0]]"
     obstruction_min_ranges: [0.5, 2.5]
+    publish_obstruction_markers: false
 ```
 
 Each inner bracket `[az1,el1, az2,el2, ...]` defines one convex polygon (minimum 3 vertices, azimuth in [0, 2π] radians, elevation in [-π/2, π/2] radians). If empty or unset, behavior is identical to the original STVL. Only applies to `model_type: 1`.
@@ -183,6 +184,8 @@ The vertices will be represented as 3D *directions* from the sensor into the wor
 <img width="2247" height="957" alt="obstruction_polygon_projection" src="https://github.com/user-attachments/assets/32c2919d-0983-493d-91b7-dd8dd22a746a" />
 
 **Tip:** When you want to have a large azimuth polygon edge, split it into multiple smaller polygons to avoid bowing and flipping. Don't use multiple smaller azimuth edges in the same polygon, this will likely cause non convexity.
+
+**Tip:** To avoid unwanted obstruction mask results when configuring the polygon vertices, it is recommended to set `publish_obstruction_markers` to `true` and verify the resulting polygons in rviz.
 
 ### local/global_costmap_params.yaml
 

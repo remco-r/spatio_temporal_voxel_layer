@@ -131,6 +131,8 @@ public:
   // Frustum model this source uses
   ModelType GetModelType(void) const;
 
+  std::string GetResolvedSensorFrame(void) const;
+
   // params setters
   void SetMinObstacleHeight(const double & min_obstacle_height);
   void SetMaxObstacleHeight(const double & max_obstacle_height);
@@ -161,6 +163,7 @@ private:
   rclcpp::Time _last_updated;
   boost::recursive_mutex _lock;
   std::string _global_frame, _sensor_frame, _source_name, _topic_name;
+  std::string _resolved_sensor_frame;  // remember frame for drawing obstruction markers
   std::list<observation::MeasurementReading> _observation_list;
   double _min_obstacle_height, _max_obstacle_height, _obstacle_range, _tf_tolerance;
   double _min_z, _max_z, _vertical_fov, _vertical_fov_padding, _horizontal_fov;

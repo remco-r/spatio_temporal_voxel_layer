@@ -65,6 +65,7 @@
 // msgs
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 #include "geometry_msgs/msg/point.hpp"
 #include "spatio_temporal_voxel_layer/srv/save_grid.hpp"
 #include "std_srvs/srv/set_bool.hpp"
@@ -176,6 +177,11 @@ private:
   rcl_interfaces::msg::SetParametersResult updateObstructionFilter(
     const std::string & source, const std::vector<rclcpp::Parameter> & parameters);
 
+  /**
+   * @brief Draw each source's obstruction polygons as marker outlines.
+   */
+  void publishObstructionMarkers(void);
+
   laser_geometry::LaserProjection _laser_projector;
   std::vector<std::shared_ptr<message_filters::SubscriberBase<rclcpp_lifecycle::LifecycleNode>>>
     _observation_subscribers;
@@ -187,6 +193,8 @@ private:
 
   bool _publish_voxels, _mapping_mode, was_reset_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _voxel_pub;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr _obstruction_marker_pub;
+  bool _republish_obstruction_markers{false};
   rclcpp::Service<spatio_temporal_voxel_layer::srv::SaveGrid>::SharedPtr _grid_saver;
   std::unique_ptr<rclcpp::Duration> _map_save_duration;
   rclcpp::Time _last_map_save_time;

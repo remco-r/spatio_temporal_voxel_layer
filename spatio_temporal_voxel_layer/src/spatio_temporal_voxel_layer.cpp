@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "spatio_temporal_voxel_layer/spatio_temporal_voxel_layer.hpp"
+#include "spatio_temporal_voxel_layer/obstruction_markers.hpp"
 #include "spatio_temporal_voxel_layer/obstruction_polygons.hpp"
 
 namespace spatio_temporal_voxel_layer
@@ -153,6 +154,9 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
       "voxel_grid", rclcpp::QoS(1), pub_opt);
   }
 
+  _obstruction_marker_pub = node->create_publisher<visualization_msgs::msg::MarkerArray>(
+    "obstruction_polygons", rclcpp::QoS(1).transient_local(), pub_opt);
+
   auto save_grid_callback = std::bind(
     &SpatioTemporalVoxelLayer::SaveGridCallback, this, _1, _2, _3);
   _grid_saver = node->create_service<spatio_temporal_voxel_layer::srv::SaveGrid>(
@@ -211,6 +215,10 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
     declareParameter(
       source + "." + "obstruction_min_ranges",
       rclcpp::ParameterValue(std::vector<double>{}));
+    declareParameter(
+      source + "." + "publish_obstruction_markers", rclcpp::ParameterValue(false));
+    declareParameter(
+      source + "." + "obstruction_marker_range", rclcpp::ParameterValue(1.0));
 
     node->get_parameter(name_ + "." + source + "." + "topic", topic);
     node->get_parameter(name_ + "." + source + "." + "sensor_frame", sensor_frame);
@@ -304,6 +312,7 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
           obstruction_filter->nPolygons(),
           source.c_str());
         _observation_buffers.back()->SetObstructionFilter(obstruction_filter);
+        _republish_obstruction_markers = true;
       }
     }
 
@@ -768,6 +777,8 @@ void SpatioTemporalVoxelLayer::updateBounds(
   double * min_x, double * min_y, double * max_x, double * max_y)
 /*****************************************************************************/
 {
+  publishObstructionMarkers();
+
   // grabs new max bounds for the costmap
   if (!_enabled) {
     return;
@@ -871,6 +882,64 @@ void SpatioTemporalVoxelLayer::SaveGridCallback(
 }
 
 /*****************************************************************************/
+void SpatioTemporalVoxelLayer::publishObstructionMarkers(void)
+/*****************************************************************************/
+{
+  if (!_republish_obstruction_markers || !_obstruction_marker_pub) {
+    return;
+  }
+  auto node = node_.lock();
+  if (!node) {
+    return;
+  }
+
+  visualization_msgs::msg::MarkerArray markers;
+  // Clear first
+  visualization_msgs::msg::Marker clear_all;
+  clear_all.action = visualization_msgs::msg::Marker::DELETEALL;
+  markers.markers.push_back(clear_all);
+
+  bool every_frame_known = true;
+
+  for (const auto & buffer : _observation_buffers) {
+    const std::string source = buffer->GetSourceName();
+    const std::string prefix = name_ + "." + source + ".";
+
+    bool publish = false;
+    node->get_parameter(prefix + "publish_obstruction_markers", publish);
+    if (!publish) {
+      continue;
+    }
+
+    // sensor_frame is optional, so the frame the polygons are defined in is only known once a
+    // cloud has arrived. Stay dirty and retry next cycle rather than publish a bad frame.
+    const std::string frame = buffer->GetResolvedSensorFrame();
+    if (frame.empty()) {
+      every_frame_known = false;
+      continue;
+    }
+
+    std::string polygons_param;
+    std::vector<double> min_ranges;
+    double radius = 1.0;
+    node->get_parameter(prefix + "obstruction_polygons", polygons_param);
+    node->get_parameter(prefix + "obstruction_min_ranges", min_ranges);
+    node->get_parameter(prefix + "obstruction_marker_range", radius);
+
+    for (auto & marker : geometry::buildObstructionMarkers(
+        polygons_param, min_ranges, frame, source, radius))
+    {
+      markers.markers.push_back(std::move(marker));
+    }
+  }
+
+  _obstruction_marker_pub->publish(markers);
+  if (every_frame_known) {
+    _republish_obstruction_markers = false;
+  }
+}
+
+/*****************************************************************************/
 rcl_interfaces::msg::SetParametersResult
 SpatioTemporalVoxelLayer::updateObstructionFilter(
   const std::string & source, const std::vector<rclcpp::Parameter> & parameters)
@@ -943,6 +1012,7 @@ SpatioTemporalVoxelLayer::updateObstructionFilter(
     buffer->Lock();
     buffer->SetObstructionFilter(obstruction_filter);
     buffer->Unlock();
+    _republish_obstruction_markers = true;
 
     if (obstruction_filter) {
       RCLCPP_INFO(
