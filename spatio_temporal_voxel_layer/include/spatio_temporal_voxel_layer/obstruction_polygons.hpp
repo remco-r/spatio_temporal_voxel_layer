@@ -309,15 +309,9 @@ struct ValidatedPolygon
 inline std::vector<ValidatedPolygon> validatePolygons(
   const std::vector<AngularPolygon> & input, const std::vector<double> & min_ranges = {})
 {
-  // Either a range for every polygon or none at all. Any other count is a mismatch only the
-  // operator can resolve: padding or truncating would silently attach a range to the wrong
-  // polygon, and so stop clearing the wrong part of the sensor's view.
-  if (!min_ranges.empty() && min_ranges.size() != input.size()) {
-    throw std::runtime_error(
-            "obstruction_min_ranges has " + std::to_string(min_ranges.size()) +
-            " values, needs " + std::to_string(input.size()) +
-            " (one per polygon) or none at all");
-  }
+  // amount of min_ranges should match with amount of polygons. However, to be able to update
+  // ranges and polygons parameters dynamically, an intermediate state where they dont match is
+  // allowed. A mismatch results in a conservative 0 range.
   for (const double range : min_ranges) {
     if (!std::isfinite(range) || range < 0.0) {
       throw std::runtime_error(
@@ -358,7 +352,7 @@ inline std::vector<ValidatedPolygon> validatePolygons(
     }
 
     // Unset means zero, i.e. the obstruction hides its whole ray
-    const double min_range = min_ranges.empty() ? 0.0 : min_ranges[idx];
+    const double min_range = idx < min_ranges.size() ? min_ranges[idx] : 0.0;
 
     // Shape and size are checked on the sphere by fromAngularVertices, which rejects a cone
     // that is degenerate, non-convex or implausibly large.

@@ -54,6 +54,27 @@ using std::placeholders::_2;
 using std::placeholders::_3;
 using rcl_interfaces::msg::ParameterType;
 
+namespace
+{
+
+/*****************************************************************************/
+void warnOnMinRangeCountMismatch(
+  const rclcpp::Logger & logger, const std::string & source, size_t n_ranges, size_t n_polygons)
+/*****************************************************************************/
+{
+  // A mismatch is deliberately tolerated so the two parameters can be resized one at a time.
+  if (n_ranges == 0 || n_ranges == n_polygons) {
+    return;
+  }
+  RCLCPP_WARN(
+    logger,
+    "%s: obstruction_min_ranges has %zu value(s) for %zu obstruction_polygons. Polygons without "
+    "min_range keep the whole ray masked. Give one value per polygon.",
+    source.c_str(), n_ranges, n_polygons);
+}
+
+}  // namespace
+
 /*****************************************************************************/
 SpatioTemporalVoxelLayer::SpatioTemporalVoxelLayer(void)
 /*****************************************************************************/
@@ -311,6 +332,8 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
           "Parsed %zu obstruction polygon(s) for %s",
           obstruction_filter->nPolygons(),
           source.c_str());
+        warnOnMinRangeCountMismatch(
+          logger_, source, obstruction_min_ranges.size(), obstruction_filter->nPolygons());
         _observation_buffers.back()->SetObstructionFilter(obstruction_filter);
         _republish_obstruction_markers = true;
       }
@@ -1018,6 +1041,8 @@ SpatioTemporalVoxelLayer::updateObstructionFilter(
       RCLCPP_INFO(
         logger_, "Parsed %zu obstruction polygon(s) for %s",
         obstruction_filter->nPolygons(), source.c_str());
+      warnOnMinRangeCountMismatch(
+        logger_, source, min_ranges.size(), obstruction_filter->nPolygons());
     } else {
       RCLCPP_INFO(logger_, "Cleared obstruction polygons for %s", source.c_str());
     }
