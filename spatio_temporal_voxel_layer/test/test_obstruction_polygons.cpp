@@ -13,13 +13,12 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
-#include "rclcpp/logger.hpp"
 #include "spatio_temporal_voxel_layer/obstruction_polygons.hpp"
 
 namespace
@@ -71,22 +70,6 @@ void expectThrowsSaying(Callable && fn, const std::string & needle)
   FAIL() << "expected std::runtime_error containing \"" << needle << "\", nothing was thrown";
 }
 
-// Minimal fake satisfying ObstructionFilter::fromParams's duck-typed NodeT
-// interface (has_parameter/declare_parameter/get_parameter), so fromParams
-// can be exercised without a real rclcpp::Node.
-class FakeParamNode
-{
-public:
-  explicit FakeParamNode(std::string polygons_param) : polygons_param_(std::move(polygons_param)) {}
-
-  bool has_parameter(const std::string &) const { return true; }
-  void declare_parameter(const std::string &, const std::string &) {}
-  void get_parameter(const std::string &, std::string & out) const { out = polygons_param_; }
-
-private:
-  std::string polygons_param_;
-};
-
 // Half-plane containment against a bare cone, for cases that need to inspect a
 // single cone's geometry before it is flattened into an ObstructionFilter.
 bool isInsideCone(const geometry::ConvexCone & cone, const geometry::SphericalPoint & p)
@@ -100,11 +83,14 @@ bool isInsideCone(const geometry::ConvexCone & cone, const geometry::SphericalPo
   return true;
 }
 
-bool isObstructedAt(const geometry::ObstructionFilter & filter, const geometry::SphericalPoint & p)
+bool isObstructedAt(
+  const geometry::ObstructionFilter & filter, const geometry::SphericalPoint & p,
+  double range = 1.0)
 {
-  const geometry::Vec3D d = toDir(p);
+  const geometry::Vec3D direction = toDir(p);
   return filter.isObstructed(
-    static_cast<float>(d.x), static_cast<float>(d.y), static_cast<float>(d.z));
+    static_cast<float>(direction.x * range), static_cast<float>(direction.y * range),
+    static_cast<float>(direction.z * range));
 }
 
 }  // namespace
@@ -112,8 +98,6 @@ bool isObstructedAt(const geometry::ObstructionFilter & filter, const geometry::
 class ObstructionPolygonsTest : public ::testing::Test
 {
 protected:
-  rclcpp::Logger logger_ = rclcpp::get_logger("test_obstruction_polygons");
-
   // A small square well clear of the azimuth wraparound and the poles, so
   // spherical distortion is small and the shape is unambiguously convex.
   geometry::AngularPolygon makeSquareCcw(double az_min, double el_min, double az_max, double el_max)
@@ -529,24 +513,20 @@ TEST_F(ObstructionPolygonsTest, ConvexConeGeodesicEdgeBowsAwayFromTheEquator)
   EXPECT_FALSE(isInsideCone(cone, {4.0, 0.0}));   // outside the azimuth span
 }
 
-TEST_F(ObstructionPolygonsTest, ConvexConeRejectsBandWhoseBowMakesItEnormous)
+TEST_F(ObstructionPolygonsTest, ConvexConeAcceptsBandWhoseBowMakesItEnormous)
 {
-  // Same band 0.2 rad wider in azimuth. Nothing about the written numbers looks
-  // alarming - 0.2 rad of elevation - but the bowed geodesics carry it to 3.81 sr,
-  // over a quarter of the sphere, so it is rejected rather than masking that much.
-  expectThrowsSaying(
-    [] {
-      geometry::ConvexCone::fromAngularVertices({{0.0, -0.1}, {3.0, -0.1}, {3.0, 0.1}, {0.0, 0.1}});
-    },
-    "far too large for a blind spot");
+  // Solid angle is still calculated for ordering, but is no longer a validity
+  // threshold. This broad yet convex cone remains representable.
+  const auto cone =
+    geometry::ConvexCone::fromAngularVertices({{0.0, -0.1}, {3.0, -0.1}, {3.0, 0.1}, {0.0, 0.1}});
+  EXPECT_GT(cone.getSolidAngle(), M_PI);
+  EXPECT_TRUE(isInsideCone(cone, {1.5, 0.0}));
 }
 
 TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsSeamStraddlingBandAnExtentRuleWouldReject)
 {
-  // Guard rail for the test above. This band straddles 0/2pi, so its azimuth extent
-  // is 6.10 - far over pi - yet it is correct today and is exactly what the docs
-  // recommend for a blind spot sitting on sensor-forward. Any rule keyed on azimuth
-  // extent would reject the documented remedy, which is why none is applied.
+  // This band straddles 0/2pi, so its chart azimuth extent is 6.10 despite
+  // representing only a narrow patch around sensor-forward.
   const auto valid =
     geometry::validatePolygons({{{6.2, -0.1}, {0.1, -0.1}, {0.1, 0.1}, {6.2, 0.1}}});
   ASSERT_EQ(valid.size(), 1u);
@@ -662,11 +642,8 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsChartCollinearVerticesAsA
   // them. On the sphere they are not degenerate at all - a straight line in the chart
   // is not a great circle - so they bound a real, if very thin, cone of 3.8e-5 sr.
   //
-  // It is accepted because kMinSolidAngle (1e-9 sr) exists to catch cones that
-  // enclose nothing, not to second-guess small ones. If chart-collinear vertices
-  // should instead be treated as a likely typo, that is a threshold decision:
-  // raising kMinSolidAngle to ~1e-4 sr would reject this while leaving every
-  // realistic mask (a 30x20 deg mast is 0.19 sr) untouched.
+  // It is accepted because chart-collinearity is not spherical degeneracy; this
+  // polygon bounds a real, if very thin, cone of about 3.8e-5 sr.
   geometry::AngularPolygon poly = {{1.0, 0.0}, {1.1, 0.05}, {1.2, 0.1}};
   const auto valid = geometry::validatePolygons({poly});
   ASSERT_EQ(valid.size(), 1u);
@@ -755,6 +732,49 @@ TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsMultipleGoodPolygons)
   EXPECT_GT(valid[2].solid_angle, 0.01);
 }
 
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsDefaultsMissingMinRangesToZero)
+{
+  const auto valid = geometry::validatePolygons({makeSquareCcw(1.0, -0.1, 1.2, 0.1)});
+  ASSERT_EQ(valid.size(), 1u);
+  EXPECT_DOUBLE_EQ(valid[0].min_range, 0.0);
+}
+
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsAcceptsOneMinRangePerPolygon)
+{
+  const auto valid = geometry::validatePolygons(
+    {makeSquareCcw(1.0, -0.1, 1.2, 0.1), makeSquareCcw(2.0, -0.1, 2.2, 0.1)},
+    {0.5, 2.5});
+  ASSERT_EQ(valid.size(), 2u);
+  EXPECT_DOUBLE_EQ(valid[0].min_range, 0.5);
+  EXPECT_DOUBLE_EQ(valid[1].min_range, 2.5);
+}
+
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsMismatchedMinRangeCount)
+{
+  const auto polygons = std::vector<geometry::AngularPolygon>{
+    makeSquareCcw(1.0, -0.1, 1.2, 0.1), makeSquareCcw(2.0, -0.1, 2.2, 0.1)};
+  expectThrowsSaying(
+    [&polygons] { geometry::validatePolygons(polygons, {1.0}); },
+    "obstruction_min_ranges has 1 values, needs 2");
+  expectThrowsSaying(
+    [&polygons] { geometry::validatePolygons(polygons, {1.0, 2.0, 3.0}); },
+    "obstruction_min_ranges has 3 values, needs 2");
+}
+
+TEST_F(ObstructionPolygonsTest, ValidatePolygonsRejectsNegativeOrNonFiniteMinRange)
+{
+  const auto polygon = makeSquareCcw(1.0, -0.1, 1.2, 0.1);
+  expectThrowsSaying(
+    [&polygon] { geometry::validatePolygons({polygon}, {-0.1}); },
+    "needs to be finite and non-negative");
+  expectThrowsSaying(
+    [&polygon] { geometry::validatePolygons({polygon}, {std::numeric_limits<double>::infinity()}); },
+    "needs to be finite and non-negative");
+  expectThrowsSaying(
+    [&polygon] { geometry::validatePolygons({polygon}, {std::numeric_limits<double>::quiet_NaN()}); },
+    "needs to be finite and non-negative");
+}
+
 TEST_F(ObstructionPolygonsTest, SolidAngleOrdersSeamPolygonBelowAGenuinelyLargerOne)
 {
   // flattenAndSortPolygons orders polygons largest-first so isObstructed's early-out
@@ -805,7 +825,7 @@ TEST_F(ObstructionPolygonsTest, ParsePolygonsFromStringParsesValidString)
 
 TEST_F(ObstructionPolygonsTest, ParsePolygonsFromStringRejectsEmptyString)
 {
-  // An empty parameter is handled one level up in fromParams (it means "no
+  // An empty parameter is handled one level up in fromParam (it means "no
   // blind spots"); reaching the parser with one is a programming error.
   expectThrowsSaying([] { geometry::parsePolygonsFromString(""); }, "expected a bracketed list");
 }
@@ -879,8 +899,8 @@ TEST_F(ObstructionPolygonsTest, ObstructionFilterIsObstructedFalseWhenEmpty)
 
 TEST_F(ObstructionPolygonsTest, ObstructionFilterIsObstructedTrueInsideConeFalseOutside)
 {
-  FakeParamNode node("[[1.0,-0.1, 1.2,-0.1, 1.2,0.1, 1.0,0.1]]");
-  auto filter = geometry::ObstructionFilter::fromParams(&node, "test", logger_);
+  auto filter =
+    geometry::ObstructionFilter::fromParam("[[1.0,-0.1, 1.2,-0.1, 1.2,0.1, 1.0,0.1]]");
   ASSERT_NE(filter, nullptr);
 
   EXPECT_TRUE(isObstructedAt(*filter, {1.1, 0.0}));   // inside the polygon
@@ -889,10 +909,9 @@ TEST_F(ObstructionPolygonsTest, ObstructionFilterIsObstructedTrueInsideConeFalse
 
 TEST_F(ObstructionPolygonsTest, ObstructionFilterIsObstructedTrueInAnyOfMultiplePolygons)
 {
-  FakeParamNode node(
+  auto filter = geometry::ObstructionFilter::fromParam(
     "[[1.0,-0.1, 1.2,-0.1, 1.2,0.1, 1.0,0.1], "
     "[2.0,-0.1, 2.2,-0.1, 2.2,0.1, 2.0,0.1]]");
-  auto filter = geometry::ObstructionFilter::fromParams(&node, "test", logger_);
   ASSERT_NE(filter, nullptr);
 
   EXPECT_TRUE(isObstructedAt(*filter, {1.1, 0.0}));   // inside first polygon
@@ -900,40 +919,79 @@ TEST_F(ObstructionPolygonsTest, ObstructionFilterIsObstructedTrueInAnyOfMultiple
   EXPECT_FALSE(isObstructedAt(*filter, {1.6, 0.0}));  // between the two
 }
 
-TEST_F(ObstructionPolygonsTest, ObstructionFilterFromParamsParsesValidParameterString)
+TEST_F(ObstructionPolygonsTest, ObstructionFilterFromParamParsesValidPolygonString)
 {
-  FakeParamNode node("[[1.0,-0.1, 1.2,-0.1, 1.2,0.1, 1.0,0.1]]");
-  auto filter = geometry::ObstructionFilter::fromParams(&node, "test", logger_);
+  auto filter =
+    geometry::ObstructionFilter::fromParam("[[1.0,-0.1, 1.2,-0.1, 1.2,0.1, 1.0,0.1]]");
   ASSERT_NE(filter, nullptr);
   EXPECT_FALSE(filter->empty());
+  EXPECT_EQ(filter->nPolygons(), 1u);
 }
 
-TEST_F(ObstructionPolygonsTest, ObstructionFilterFromParamsReturnsNullWhenParamEmpty)
+TEST_F(ObstructionPolygonsTest, ObstructionFilterFromParamReturnsNullWhenPolygonStringEmpty)
 {
-  // Unset parameter is the common case: no blind spots to mask, not an error.
-  FakeParamNode node("");
-  auto filter = geometry::ObstructionFilter::fromParams(&node, "test", logger_);
+  auto filter = geometry::ObstructionFilter::fromParam("");
   EXPECT_EQ(filter, nullptr);
 }
 
-TEST_F(ObstructionPolygonsTest, ObstructionFilterFromParamsThrowsOnInvalidPolygon)
+TEST_F(ObstructionPolygonsTest, ObstructionFilterFromParamThrowsOnInvalidPolygon)
 {
-  // Azimuth out of [0, 2pi] range -> fails validation. fromParams no longer
-  // degrades to a null (unmasked) filter; it names the parameter and rethrows
-  // so the layer fails to configure instead of running with a wrong mask.
-  FakeParamNode node("[[-0.1,-0.1, 1.0,-0.1, 0.5,0.1]]");
+  // Invalid input throws a contextual error instead of silently disabling the filter.
   expectThrowsSaying(
-    [&node, this] { geometry::ObstructionFilter::fromParams(&node, "test", logger_); },
-    "Invalid 'test.obstruction_polygons': obstruction polygon 0 has azimuth -0.100000 "
-    "outside [0, 2pi]");
+    [] { geometry::ObstructionFilter::fromParam("[[-0.1,-0.1, 1.0,-0.1, 0.5,0.1]]"); },
+    "Invalid obstruction configuration. obstruction_polygons:");
+  expectThrowsSaying(
+    [] { geometry::ObstructionFilter::fromParam("[[-0.1,-0.1, 1.0,-0.1, 0.5,0.1]]"); },
+    "obstruction polygon 0 has azimuth -0.100000 outside [0, 2pi]");
 }
 
-TEST_F(ObstructionPolygonsTest, ObstructionFilterFromParamsThrowsOnUnparsableString)
+TEST_F(ObstructionPolygonsTest, ObstructionFilterFromParamThrowsOnUnparsableString)
 {
-  FakeParamNode node("this is not a polygon list");
   expectThrowsSaying(
-    [&node, this] { geometry::ObstructionFilter::fromParams(&node, "test", logger_); },
-    "Invalid 'test.obstruction_polygons': expected a bracketed list");
+    [] { geometry::ObstructionFilter::fromParam("this is not a polygon list"); },
+    "Invalid obstruction configuration. obstruction_polygons:");
+  expectThrowsSaying(
+    [] { geometry::ObstructionFilter::fromParam("this is not a polygon list"); },
+    "expected a bracketed list");
+}
+
+TEST_F(ObstructionPolygonsTest, ObstructionFilterFromParamRejectsInvalidMinRanges)
+{
+  const std::string polygons = "[[1.0,-0.1, 1.2,-0.1, 1.2,0.1, 1.0,0.1]]";
+  expectThrowsSaying(
+    [&polygons] { geometry::ObstructionFilter::fromParam(polygons, {-0.1}); },
+    "obstruction_min_ranges has value -0.100000");
+  expectThrowsSaying(
+    [&polygons] { geometry::ObstructionFilter::fromParam(polygons, {1.0, 2.0}); },
+    "obstruction_min_ranges has 2 values, needs 1");
+}
+
+TEST_F(ObstructionPolygonsTest, ObstructionFilterMinRangeLeavesPointsInFrontClearable)
+{
+  const auto filter = geometry::ObstructionFilter::fromParam(
+    "[[1.0,-0.1, 1.2,-0.1, 1.2,0.1, 1.0,0.1]]", {2.0});
+  ASSERT_NE(filter, nullptr);
+
+  EXPECT_FALSE(isObstructedAt(*filter, {1.1, 0.0}, 1.99));
+  EXPECT_TRUE(isObstructedAt(*filter, {1.1, 0.0}, 2.01));
+  EXPECT_FALSE(isObstructedAt(*filter, {1.6, 0.0}, 3.0));
+}
+
+TEST_F(ObstructionPolygonsTest, ObstructionFilterKeepsMinRangesWithPolygonsWhenSorted)
+{
+  // The second polygon is larger and is searched first after sorting. Its range
+  // and the first polygon's range must stay paired with their original polygons.
+  const auto filter = geometry::ObstructionFilter::fromParam(
+    "[[1.0,-0.1, 1.2,-0.1, 1.2,0.1, 1.0,0.1], "
+    "[2.0,-0.2, 2.4,-0.2, 2.4,0.2, 2.0,0.2]]",
+    {4.0, 2.0});
+  ASSERT_NE(filter, nullptr);
+  ASSERT_EQ(filter->nPolygons(), 2u);
+
+  EXPECT_FALSE(isObstructedAt(*filter, {1.1, 0.0}, 3.0));
+  EXPECT_TRUE(isObstructedAt(*filter, {1.1, 0.0}, 4.1));
+  EXPECT_FALSE(isObstructedAt(*filter, {2.2, 0.0}, 1.0));
+  EXPECT_TRUE(isObstructedAt(*filter, {2.2, 0.0}, 2.1));
 }
 
 int main(int argc, char ** argv)

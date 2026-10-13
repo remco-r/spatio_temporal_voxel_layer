@@ -119,7 +119,6 @@ if(BUILD_TESTING)
   ament_add_gtest(test_obstruction_polygons test/test_obstruction_polygons.cpp)
   target_include_directories(test_obstruction_polygons PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  ament_target_dependencies(test_obstruction_polygons rclcpp)
 endif()
 
 install(TARGETS ${library_name}
