@@ -581,6 +581,8 @@ class MainWindow(QMainWindow):
 
         col_vals = np.unwrap(self._fill_nan(col_vals))
         row_vals = self._fill_nan(row_vals)
+        row_vals = self._monotonic_fit(
+            row_vals, increasing=row_vals[-1] >= row_vals[0])
 
         # Smooth per-index calibration (used for a consistent pixel<->angle model).
         self._col_az = col_vals
@@ -603,10 +605,39 @@ class MainWindow(QMainWindow):
         return a
 
     @staticmethod
+    def _monotonic_fit(values: np.ndarray, increasing: bool) -> np.ndarray:
+        """Fit a monotonic calibration while minimally adjusting noisy samples."""
+        sign = 1.0 if increasing else -1.0
+        blocks = []
+        for index, value in enumerate(sign * np.asarray(values, dtype=float)):
+            blocks.append([value, 1, index, index + 1])
+            while (len(blocks) > 1
+                   and blocks[-2][0] / blocks[-2][1] > blocks[-1][0] / blocks[-1][1]):
+                right = blocks.pop()
+                left = blocks.pop()
+                blocks.append([
+                    left[0] + right[0],
+                    left[1] + right[1],
+                    left[2],
+                    right[3],
+                ])
+
+        fitted = np.empty(len(values), dtype=float)
+        for total, count, start, end in blocks:
+            fitted[start:end] = sign * total / count
+        return fitted
+
+    @staticmethod
     def _as_increasing(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Sort (x, y) so x is strictly increasing (required by np.interp)."""
+        """Sort (x, y) and merge duplicate x values for a stable inverse lookup."""
         order = np.argsort(x, kind='stable')
-        return x[order], y[order]
+        sorted_x = x[order]
+        sorted_y = y[order]
+        increasing_x, starts, counts = np.unique(
+            sorted_x, return_index=True, return_counts=True)
+        if np.any(counts > 1):
+            sorted_y = np.add.reduceat(sorted_y, starts) / counts
+        return increasing_x, sorted_y
 
     @staticmethod
     def _interp_extrap(x: float, xp: np.ndarray, fp: np.ndarray) -> float:
@@ -614,10 +645,18 @@ class MainWindow(QMainWindow):
         (np.interp clamps). Lets vertices/arcs extend just outside the FOV grid."""
         x = float(x)
         if x < xp[0]:
-            slope = (fp[1] - fp[0]) / (xp[1] - xp[0])
+            next_distinct = np.flatnonzero(fp != fp[0])
+            if len(next_distinct) == 0:
+                return float(fp[0])
+            i = next_distinct[0]
+            slope = (fp[i] - fp[0]) / (xp[i] - xp[0])
             return float(fp[0] + (x - xp[0]) * slope)
         if x > xp[-1]:
-            slope = (fp[-1] - fp[-2]) / (xp[-1] - xp[-2])
+            previous_distinct = np.flatnonzero(fp != fp[-1])
+            if len(previous_distinct) == 0:
+                return float(fp[-1])
+            i = previous_distinct[-1]
+            slope = (fp[-1] - fp[i]) / (xp[-1] - xp[i])
             return float(fp[-1] + (x - xp[-1]) * slope)
         return float(np.interp(x, xp, fp))
 
@@ -818,4 +857,3 @@ class MainWindow(QMainWindow):
 
         self._status.showMessage(
             f"Loaded {len(config.regions)} regions from {filepath}")
-
