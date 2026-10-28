@@ -97,6 +97,18 @@ add_library(${library_name} SHARED
             src/vdb2pc.cpp
 )
 
+option(STVL_BUILD_BENCHMARKS "Build Google Benchmark targets" ON)
+if(STVL_BUILD_BENCHMARKS)
+  find_package(benchmark REQUIRED)
+  add_executable(vertical_fov_check_benchmark
+    benchmark/vertical_fov_check_benchmark.cpp
+  )
+  target_include_directories(vertical_fov_check_benchmark PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/frustum_models"
+  )
+  target_link_libraries(vertical_fov_check_benchmark PRIVATE benchmark::benchmark)
+endif()
+
 target_link_libraries(${library_name} "${cpp_typesupport_target}")
 
 target_link_libraries(${library_name}

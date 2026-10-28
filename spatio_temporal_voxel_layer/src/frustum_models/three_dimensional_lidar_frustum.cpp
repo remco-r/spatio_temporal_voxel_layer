@@ -37,6 +37,8 @@
 
 #include <spatio_temporal_voxel_layer/frustum_models/three_dimensional_lidar_frustum.hpp>
 
+#include "vertical_fov_check.hpp"
+
 namespace geometry
 {
 
@@ -94,17 +96,10 @@ bool ThreeDimensionalLidarFrustum::IsInside(const openvdb::Vec3d & pt)
   }
 
   // Check if inside frustum valid vFOV
-  const double z_rel;
-  if (_vFOVOffset == 0.0) {
-    z_rel = transformed_pt[2];
-  } else {
-    // avoid calculating square root of radial distance when not necessary
-    z_rel = transformed_pt[2] - sqrt(radial_distance_squared) * _tan_vFOVOffset;
-  }
-  const double v_padded = fabs(z_rel) + _vFOVPadding;
-
-  if (v_padded * v_padded >
-    radial_distance_squared * _tan_vFOVhalf_squared) {
+  if (!detail::IsInsideVerticalFov(
+      transformed_pt[2], radial_distance_squared, _vFOVPadding,
+      _tan_vFOVhalf_squared, _vFOVOffset, _tan_vFOVOffset))
+  {
     return false;
   }
 
