@@ -62,14 +62,12 @@ namespace
 {
 
 std::vector<geometry_msgs::msg::Point> sampleObstructionBoundary(
-  const geometry::AngularPolygon & vertices, double visualization_range,
-  size_t samples_per_edge = 12)
+  const geometry::AngularPolygon & vertices, double visualization_range)
 {
+  constexpr size_t kSamplesPerEdge = 12;
+
   std::vector<geometry_msgs::msg::Point> loop;
   const size_t n = vertices.size();
-  if (n < 2 || samples_per_edge == 0) {
-    return loop;
-  }
 
   std::vector<geometry::Vec3D> directions(n);
   for (size_t i = 0; i < n; ++i) {
@@ -80,7 +78,7 @@ std::vector<geometry_msgs::msg::Point> sampleObstructionBoundary(
       std::sin(vertices[i].elevation)};
   }
 
-  loop.reserve(n * samples_per_edge + 1);
+  loop.reserve(n * kSamplesPerEdge + 1);
   for (size_t i = 0; i < n; ++i) {
     const auto & a = directions[i];
     const auto & b = directions[(i + 1) % n];
@@ -89,8 +87,8 @@ std::vector<geometry_msgs::msg::Point> sampleObstructionBoundary(
     const double omega = std::acos(dot);
     const double sin_omega = std::sin(omega);
 
-    for (size_t k = 0; k < samples_per_edge; ++k) {
-      const double t = static_cast<double>(k) / static_cast<double>(samples_per_edge);
+    for (size_t k = 0; k < kSamplesPerEdge; ++k) {
+      const double t = static_cast<double>(k) / static_cast<double>(kSamplesPerEdge);
       const bool degenerate = sin_omega < 1e-9;
       // Slerp samples the shorter spherical arc; use linear weights near zero angle.
       const double wa = degenerate ? (1.0 - t) : std::sin((1.0 - t) * omega) / sin_omega;
@@ -123,10 +121,6 @@ std::vector<visualization_msgs::msg::Marker> buildObstructionMarkers(
   const std::string & polygons_param, const std::vector<double> & min_ranges,
   const std::string & frame, const std::string & ns, double visualization_range)
 {
-  if (!std::isfinite(visualization_range) || visualization_range <= 0.0) {
-    throw std::invalid_argument("obstruction marker range must be finite and greater than zero");
-  }
-
   std::vector<visualization_msgs::msg::Marker> markers;
   if (polygons_param.empty() || frame.empty()) {
     return markers;
@@ -370,9 +364,9 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
       publish_obstruction_markers &&
       (!std::isfinite(obstruction_marker_range) || obstruction_marker_range <= 0.0))
     {
-      throw std::runtime_error(
-              name_ + "." + source +
-              ".obstruction_marker_range must be finite and greater than zero");
+      RCLCPP_WARN(logger_, "%s.%s.obstruction_marker_range must be finite and greater than zero. Using default value of 1.0.",
+        name_.c_str(), source.c_str());
+      obstruction_marker_range = 1.0;
     }
 
     if (filter_str == "passthrough") {
@@ -1003,10 +997,11 @@ void SpatioTemporalVoxelLayer::publishObstructionMarkers(void)
     return;
   }
 
-  visualization_msgs::msg::MarkerArray markers;
+  std::unique_ptr<visualization_msgs::msg::MarkerArray> markers =
+      std::make_unique<visualization_msgs::msg::MarkerArray>();
   visualization_msgs::msg::Marker clear_all;
   clear_all.action = visualization_msgs::msg::Marker::DELETEALL;
-  markers.markers.push_back(clear_all);
+  markers->markers.push_back(clear_all);
 
   for (const auto & config : _obstruction_marker_configs) {
     const std::string source = config.buffer->GetSourceName();
@@ -1020,11 +1015,11 @@ void SpatioTemporalVoxelLayer::publishObstructionMarkers(void)
     for (auto & marker : buildObstructionMarkers(
         config.polygons, config.min_ranges, frame, source, config.visualization_range))
     {
-      markers.markers.push_back(std::move(marker));
+      markers->markers.push_back(std::move(marker));
     }
   }
 
-  _obstruction_marker_pub->publish(markers);
+  _obstruction_marker_pub->publish(std::move(markers));
   _obstruction_markers_pending = false;
 }
 
