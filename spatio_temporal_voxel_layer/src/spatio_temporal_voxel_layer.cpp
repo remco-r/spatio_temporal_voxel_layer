@@ -159,7 +159,7 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   }
 
   _obstruction_marker_pub = node->create_publisher<visualization_msgs::msg::MarkerArray>(
-    "obstruction_polygons", rclcpp::QoS(1).transient_local(), callback_group_);
+    name_ + "_obstruction_markers", rclcpp::QoS(1).transient_local(), callback_group_);
 
   auto save_grid_callback = std::bind(
     &SpatioTemporalVoxelLayer::SaveGridCallback, this, _1, _2, _3);
@@ -605,6 +605,10 @@ void SpatioTemporalVoxelLayer::activate(void)
     _voxel_pub->on_activate();
   }
 
+  if (_obstruction_marker_pub) {
+    _obstruction_marker_pub->on_activate();
+  }
+
   observation_subscribers_iter sub_it = _observation_subscribers.begin();
   for (; sub_it != _observation_subscribers.end(); ++sub_it) {
     (*sub_it)->subscribe();
@@ -630,6 +634,10 @@ void SpatioTemporalVoxelLayer::deactivate(void)
 
   if (_voxel_pub) {
     _voxel_pub->on_deactivate();
+  }
+
+  if (_obstruction_marker_pub) {
+    _obstruction_marker_pub->on_deactivate();
   }
 
   observation_subscribers_iter sub_it = _observation_subscribers.begin();
@@ -785,8 +793,6 @@ void SpatioTemporalVoxelLayer::updateBounds(
   double * min_x, double * min_y, double * max_x, double * max_y)
 /*****************************************************************************/
 {
-  publishObstructionMarkers();
-
   // grabs new max bounds for the costmap
   if (!_enabled) {
     return;
@@ -846,7 +852,7 @@ void SpatioTemporalVoxelLayer::updateBounds(
       std::make_shared<spatio_temporal_voxel_layer::srv::SaveGrid::Response>();
     request->file_name = time_buffer;
     SaveGridCallback(nullptr, request, response);
-  }
+    }
 
   // mark observations
   _voxel_grid->Mark(marking_observations);
@@ -863,6 +869,8 @@ void SpatioTemporalVoxelLayer::updateBounds(
     pc2->header.stamp = node->now();
     _voxel_pub->publish(std::move(pc2));
   }
+
+  publishObstructionMarkers();
 
   // update footprint
   updateFootprint(robot_x, robot_y, robot_yaw, min_x, min_y, max_x, max_y);
@@ -906,14 +914,18 @@ void SpatioTemporalVoxelLayer::publishObstructionMarkers(void)
   clear_all.action = visualization_msgs::msg::Marker::DELETEALL;
   markers->markers.push_back(clear_all);
 
+  bool has_known_frame = false;
+  bool has_unknown_frame = false;
   for (const auto & config : _obstruction_marker_configs) {
     const std::string source = config.buffer->GetSourceName();
     config.buffer->Lock();
     const std::string frame = config.buffer->GetResolvedSensorFrame();
     config.buffer->Unlock();
     if (frame.empty()) {
-      return;
+      has_unknown_frame = true;
+      continue;
     }
+    has_known_frame = true;
 
     for (auto & marker : obstruction_visualization::buildObstructionMarkers(
         config.polygons, config.min_ranges, frame, source, config.visualization_range))
@@ -922,8 +934,12 @@ void SpatioTemporalVoxelLayer::publishObstructionMarkers(void)
     }
   }
 
+  if (!has_known_frame) {
+    return;
+  }
+
   _obstruction_marker_pub->publish(std::move(markers));
-  _obstruction_markers_pending = false;
+  _obstruction_markers_pending = has_unknown_frame;
 }
 
 rcl_interfaces::msg::SetParametersResult
